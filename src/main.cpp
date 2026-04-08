@@ -3,6 +3,7 @@
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 #include <BleMouse.h>
+#include <BLEDevice.h>
 
 Adafruit_MPU6050 mpu;
 BleMouse bleMouse("ESP32 MPU Mouse", "Espressif", 100);
@@ -77,7 +78,26 @@ void loop()
 {
   static uint32_t lastSampleMs = 0;
   static uint32_t lastStatusMs = 0;
+  static uint32_t lastAdvertiseKickMs = 0;
+  static bool wasConnected = false;
   const uint32_t nowMs = millis();
+  const bool connected = bleMouse.isConnected();
+
+  if (connected && !wasConnected)
+  {
+    Serial.println("BLE connected.");
+  }
+
+  if (!connected && wasConnected)
+  {
+    BLEDevice::startAdvertising();
+    filteredDpsX = 0.0f;
+    filteredDpsY = 0.0f;
+    lastAdvertiseKickMs = nowMs;
+    Serial.println("BLE disconnected. Re-advertising for any host...");
+  }
+
+  wasConnected = connected;
 
   if (nowMs - lastSampleMs < 10)
   {
@@ -85,8 +105,14 @@ void loop()
   }
   lastSampleMs = nowMs;
 
-  if (!bleMouse.isConnected())
+  if (!connected)
   {
+    if (nowMs - lastAdvertiseKickMs > 5000)
+    {
+      BLEDevice::startAdvertising();
+      lastAdvertiseKickMs = nowMs;
+    }
+
     if (nowMs - lastStatusMs > 1000)
     {
       Serial.println("Waiting for BLE mouse connection...");
