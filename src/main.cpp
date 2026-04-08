@@ -13,6 +13,8 @@ constexpr float GYRO_DEADBAND_DPS = 1.6f;
 constexpr float GYRO_TO_MOUSE_GAIN = 0.14f;
 constexpr float SMOOTHING_ALPHA = 0.28f;
 constexpr uint16_t CALIBRATION_SAMPLES = 400;
+constexpr uint16_t BLE_POST_CONNECT_DELAY_MS = 1200;
+constexpr uint16_t BLE_REPORT_INTERVAL_MS = 16;
 
 float gyroBiasX = 0.0f;
 float gyroBiasY = 0.0f;
@@ -79,12 +81,16 @@ void loop()
   static uint32_t lastSampleMs = 0;
   static uint32_t lastStatusMs = 0;
   static uint32_t lastAdvertiseKickMs = 0;
+  static uint32_t connectedSinceMs = 0;
+  static uint32_t lastReportMs = 0;
   static bool wasConnected = false;
   const uint32_t nowMs = millis();
   const bool connected = bleMouse.isConnected();
 
   if (connected && !wasConnected)
   {
+    connectedSinceMs = nowMs;
+    lastReportMs = nowMs;
     Serial.println("BLE connected.");
   }
 
@@ -93,6 +99,8 @@ void loop()
     BLEDevice::startAdvertising();
     filteredDpsX = 0.0f;
     filteredDpsY = 0.0f;
+    connectedSinceMs = 0;
+    lastReportMs = 0;
     lastAdvertiseKickMs = nowMs;
     Serial.println("BLE disconnected. Re-advertising for any host...");
   }
@@ -121,6 +129,16 @@ void loop()
     return;
   }
 
+  if ((nowMs - connectedSinceMs) < BLE_POST_CONNECT_DELAY_MS)
+  {
+    if (nowMs - lastStatusMs > 1000)
+    {
+      Serial.println("BLE link up. Waiting for HID notifications to be ready...");
+      lastStatusMs = nowMs;
+    }
+    return;
+  }
+
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
@@ -139,9 +157,10 @@ void loop()
   moveX = constrain(moveX, -127, 127);
   moveY = constrain(moveY, -127, 127);
 
-  if (moveX != 0 || moveY != 0)
+  if ((moveX != 0 || moveY != 0) && (nowMs - lastReportMs >= BLE_REPORT_INTERVAL_MS))
   {
     bleMouse.move(static_cast<int8_t>(moveX), static_cast<int8_t>(moveY));
+    lastReportMs = nowMs;
   }
 
   if (nowMs - lastStatusMs > 1000)
