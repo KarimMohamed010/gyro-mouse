@@ -13,7 +13,7 @@ Preferences preferences;
 
 constexpr float RAD_TO_DEG_F = 57.29577951308232f;
 constexpr float GYRO_DEADBAND_DPS = 1.6f;
-constexpr float GYRO_TO_MOUSE_GAIN = 0.14f;
+constexpr float GYRO_TO_MOUSE_GAIN = 0.35f;
 constexpr float SMOOTHING_ALPHA = 0.28f;
 constexpr uint16_t CALIBRATION_SAMPLES = 400;
 constexpr uint32_t SAMPLE_PERIOD_MS = 10;
@@ -26,6 +26,16 @@ constexpr uint32_t GESTURE_COOLDOWN_MS = 700;
 constexpr uint32_t POST_GESTURE_CURSOR_HOLD_MS = 130;
 constexpr float GESTURE_MIN_MATCH_SCORE = 0.72f;
 constexpr size_t GESTURE_MIN_TOKENS = 3;
+constexpr uint32_t BUTTON_DEBOUNCE_MS = 30;
+constexpr uint32_t BUTTON_CAPTURE_HARD_TIMEOUT_MS = 6000;
+
+constexpr uint8_t BTN_LEFT_PIN = 34;
+constexpr uint8_t BTN_RIGHT_PIN = 35;
+constexpr uint8_t BTN_SHORTCUT_PIN = 39;
+
+// GPIO34/35/39 are input-only and require external pull resistors.
+// false means button is considered pressed when pin reads HIGH.
+constexpr bool BUTTON_ACTIVE_LOW = false;
 
 constexpr const char *PREF_NAMESPACE = "gestures";
 constexpr const char *PREF_KEY_DB = "db";
@@ -51,10 +61,31 @@ String trainingAction;
 
 bool gestureCapturing = false;
 bool captureForTraining = false;
+bool captureByButton = false;
 String captureTokens;
 uint32_t gestureStartMs = 0;
 uint32_t gestureLastActiveMs = 0;
 uint32_t lastGestureFinishMs = 0;
+int activeButtonPin = -1;
+String activeButtonFilter;
+String activeButtonLabel;
+
+struct GestureButton
+{
+  uint8_t pin;
+  const char *filter;
+  const char *label;
+  bool stablePressed;
+  bool lastRawPressed;
+  uint32_t lastRawChangeMs;
+};
+
+GestureButton gestureButtons[] = {
+    {BTN_LEFT_PIN, "left", "LEFT", false, false, 0},
+    {BTN_RIGHT_PIN, "right", "RIGHT", false, false, 0},
+    {BTN_SHORTCUT_PIN, "shortcut", "SHORTCUT", false, false, 0}};
+
+bool findBestGestureMatch(const String &tokens, GestureTemplate &bestGesture, float &bestScore, const String &actionFilter);
 
 float min3(float a, float b, float c)
 {
@@ -295,11 +326,46 @@ int levenshteinDistance(const String &a, const String &b)
 
 bool findBestGestureMatch(const String &tokens, GestureTemplate &bestGesture, float &bestScore)
 {
+  return findBestGestureMatch(tokens, bestGesture, bestScore, "any");
+}
+
+bool actionMatchesFilter(const String &action, const String &filter)
+{
+  const String normalizedAction = normalizeAction(action);
+  const String normalizedFilter = normalizeAction(filter);
+
+  if (normalizedFilter == "any")
+  {
+    return true;
+  }
+  if (normalizedFilter == "left")
+  {
+    return normalizedAction == "left" || normalizedAction == "left_click";
+  }
+  if (normalizedFilter == "right")
+  {
+    return normalizedAction == "right" || normalizedAction == "right_click";
+  }
+  if (normalizedFilter == "shortcut")
+  {
+    return normalizedAction.startsWith("key:");
+  }
+
+  return normalizedAction == normalizedFilter;
+}
+
+bool findBestGestureMatch(const String &tokens, GestureTemplate &bestGesture, float &bestScore, const String &actionFilter)
+{
   bestScore = 0.0f;
   bool found = false;
 
   for (const GestureTemplate &item : gestureDb)
   {
+    if (!actionMatchesFilter(item.action, actionFilter))
+    {
+      continue;
+    }
+
     const int maxLen = max(tokens.length(), item.tokens.length());
     if (maxLen <= 0)
     {
@@ -318,6 +384,39 @@ bool findBestGestureMatch(const String &tokens, GestureTemplate &bestGesture, fl
   }
 
   return found && bestScore >= GESTURE_MIN_MATCH_SCORE;
+}
+
+String defaultActionForFilter(const String &filter)
+{
+  if (filter == "left")
+  {
+    return "left";
+  }
+  if (filter == "right")
+  {
+    return "right";
+  }
+  return "key:unassigned";
+}
+
+String nextAutoGestureName(const String &filter)
+{
+  String prefix = normalizeName(filter);
+  if (prefix.isEmpty())
+  {
+    prefix = "gesture";
+  }
+
+  for (uint16_t i = 1; i < 2000; ++i)
+  {
+    String candidate = prefix + String(i);
+    if (findGestureIndexByName(candidate) < 0)
+    {
+      return candidate;
+    }
+  }
+
+  return prefix + String(millis());
 }
 
 void executeGestureAction(const String &action)
@@ -362,6 +461,121 @@ void startGestureCapture(bool trainingMode, uint32_t nowMs)
   else
   {
     Serial.println("Gesture capture started.");
+  }
+}
+
+void finalizeButtonGestureCapture(uint32_t nowMs)
+{
+  gestureCapturing = false;
+  captureByButton = false;
+  lastGestureFinishMs = nowMs;
+
+  const String filter = activeButtonFilter;
+  const String label = activeButtonLabel;
+  activeButtonFilter = "";
+  activeButtonLabel = "";
+  activeButtonPin = -1;
+
+  if (captureTokens.length() < static_cast<int>(GESTURE_MIN_TOKENS))
+  {
+    Serial.printf("%s gesture ignored (too short).\n", label.c_str());
+    return;
+  }
+
+  GestureTemplate match;
+  float score = 0.0f;
+  if (findBestGestureMatch(captureTokens, match, score, filter))
+  {
+    Serial.printf("%s gesture matched '%s' (score=%.2f)\n", label.c_str(), match.name.c_str(), score);
+    executeGestureAction(match.action);
+    return;
+  }
+
+  const String autoName = nextAutoGestureName(filter);
+  const String autoAction = defaultActionForFilter(filter);
+  upsertGesture(autoName, autoAction, captureTokens);
+  Serial.printf("New %s gesture saved as '%s' with action '%s'.\n",
+                label.c_str(),
+                autoName.c_str(),
+                autoAction.c_str());
+
+  if (filter == "shortcut")
+  {
+    Serial.printf("Bind a real shortcut with: bind %s key:<shortcut>\n", autoName.c_str());
+  }
+}
+
+void startButtonGestureCapture(const GestureButton &btn, uint32_t nowMs)
+{
+  if (gestureCapturing)
+  {
+    return;
+  }
+
+  startGestureCapture(false, nowMs);
+  captureByButton = true;
+  activeButtonPin = btn.pin;
+  activeButtonFilter = btn.filter;
+  activeButtonLabel = btn.label;
+  Serial.printf("%s gesture started. Move sensor, then press same button again to end.\n", btn.label);
+}
+
+void onGestureButtonPressed(const GestureButton &btn, uint32_t nowMs)
+{
+  if (!gestureCapturing)
+  {
+    startButtonGestureCapture(btn, nowMs);
+    return;
+  }
+
+  if (captureByButton)
+  {
+    if (btn.pin != activeButtonPin)
+    {
+      Serial.printf("%s capture is active. Press %s button again to end.\n", activeButtonLabel.c_str(), activeButtonLabel.c_str());
+      return;
+    }
+    finalizeButtonGestureCapture(nowMs);
+    return;
+  }
+
+  Serial.println("Training capture is active. Finish it before using button capture.");
+}
+
+bool isButtonPressedRaw(uint8_t pin)
+{
+  const int value = digitalRead(pin);
+  if (BUTTON_ACTIVE_LOW)
+  {
+    return value == LOW;
+  }
+  return value == HIGH;
+}
+
+void pollGestureButtons(uint32_t nowMs)
+{
+  for (GestureButton &btn : gestureButtons)
+  {
+    const bool rawPressed = isButtonPressedRaw(btn.pin);
+    if (rawPressed != btn.lastRawPressed)
+    {
+      btn.lastRawPressed = rawPressed;
+      btn.lastRawChangeMs = nowMs;
+    }
+
+    if ((nowMs - btn.lastRawChangeMs) < BUTTON_DEBOUNCE_MS)
+    {
+      continue;
+    }
+
+    if (rawPressed != btn.stablePressed)
+    {
+      btn.stablePressed = rawPressed;
+      if (btn.stablePressed)
+      {
+        onGestureButtonPressed(btn, nowMs);
+      }
+    }
   }
 }
 
@@ -410,6 +624,11 @@ bool processGestureEngine(float xDps, float yDps, uint32_t nowMs)
 
   if (!gestureCapturing)
   {
+    if (!trainingPending)
+    {
+      return false;
+    }
+
     if (nowMs - lastGestureFinishMs < GESTURE_COOLDOWN_MS)
     {
       return false;
@@ -429,6 +648,17 @@ bool processGestureEngine(float xDps, float yDps, uint32_t nowMs)
   {
     appendToken(captureTokens, directionToken(xDps, yDps));
     gestureLastActiveMs = nowMs;
+  }
+
+  if (captureByButton)
+  {
+    if ((nowMs - gestureStartMs) >= BUTTON_CAPTURE_HARD_TIMEOUT_MS)
+    {
+      Serial.println("Button capture timed out. Press button to start again.");
+      finalizeButtonGestureCapture(nowMs);
+      return false;
+    }
+    return true;
   }
 
   const bool timeoutReached = (nowMs - gestureStartMs) >= GESTURE_MAX_MS;
@@ -552,16 +782,26 @@ void handleSerialInput()
   while (Serial.available() > 0)
   {
     char ch = static_cast<char>(Serial.read());
-    if (ch == '\r')
+
+    if (ch == '\b' || static_cast<uint8_t>(ch) == 127)
     {
+      if (!serialLine.isEmpty())
+      {
+        serialLine.remove(serialLine.length() - 1);
+      }
       continue;
     }
-    if (ch == '\n')
+
+    if (ch == '\r' || ch == '\n')
     {
-      handleCommand(serialLine);
+      if (!serialLine.isEmpty())
+      {
+        handleCommand(serialLine);
+      }
       serialLine = "";
       continue;
     }
+
     if (serialLine.length() < 160)
     {
       serialLine += ch;
@@ -618,6 +858,10 @@ void setup(void)
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
+  pinMode(BTN_LEFT_PIN, INPUT);
+  pinMode(BTN_RIGHT_PIN, INPUT);
+  pinMode(BTN_SHORTCUT_PIN, INPUT);
+
   calibrateGyro();
 
   preferences.begin(PREF_NAMESPACE, false);
@@ -626,6 +870,11 @@ void setup(void)
   bleMouse.begin();
   Serial.println("Pair to device: ESP32 MPU Mouse");
   Serial.println("Type 'help' in Serial Monitor for gesture commands.");
+  Serial.println("Button gesture mode:");
+  Serial.println("  D34 => left-click gesture start/end");
+  Serial.println("  D35 => right-click gesture start/end");
+  Serial.println("  D39 => shortcut gesture start/end");
+  Serial.println("Press button once to start gesture, press same button again to end.");
 
   if (gestureDb.empty())
   {
@@ -649,6 +898,7 @@ void loop()
   const bool connected = bleMouse.isConnected();
 
   handleSerialInput();
+  pollGestureButtons(nowMs);
 
   if (connected && !wasConnected)
   {
