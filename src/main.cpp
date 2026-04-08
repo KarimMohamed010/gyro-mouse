@@ -10,14 +10,14 @@ BleMouse bleMouse("ESP32 MPU Mouse", "Espressif", 100);
 
 constexpr float RAD_TO_DEG_F = 57.29577951308232f;
 constexpr float GYRO_DEADBAND_DPS = 1.6f;
-constexpr float GYRO_TO_MOUSE_GAIN = 0.14f;
+constexpr float GYRO_TO_MOUSE_GAIN = 0.3f;
 constexpr float SMOOTHING_ALPHA = 0.28f;
 constexpr uint16_t CALIBRATION_SAMPLES = 400;
 constexpr uint16_t BLE_POST_CONNECT_DELAY_MS = 1200;
 constexpr uint16_t BLE_REPORT_INTERVAL_MS = 16;
 constexpr uint8_t PIN_BTN_LEFT = 34;
 constexpr uint8_t PIN_BTN_RIGHT = 35;
-constexpr uint8_t PIN_BTN_SCROLL_DOWN = 33;
+constexpr uint8_t PIN_BTN_SCROLL_DOWN = 39;
 constexpr uint16_t BUTTON_DEBOUNCE_MS = 40;
 constexpr uint16_t SCROLL_REPEAT_MS = 120;
 
