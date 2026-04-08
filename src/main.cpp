@@ -2,87 +2,128 @@
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
+#include <BleMouse.h>
 
 Adafruit_MPU6050 mpu;
+BleMouse bleMouse("ESP32 MPU Mouse", "Espressif", 100);
+
+constexpr float RAD_TO_DEG_F = 57.29577951308232f;
+constexpr float GYRO_DEADBAND_DPS = 1.6f;
+constexpr float GYRO_TO_MOUSE_GAIN = 0.14f;
+constexpr float SMOOTHING_ALPHA = 0.28f;
+constexpr uint16_t CALIBRATION_SAMPLES = 400;
+
+float gyroBiasX = 0.0f;
+float gyroBiasY = 0.0f;
+float filteredDpsX = 0.0f;
+float filteredDpsY = 0.0f;
+
+float applyDeadband(float value, float deadband)
+{
+  if (fabsf(value) < deadband)
+  {
+    return 0.0f;
+  }
+  return value;
+}
+
+void calibrateGyro()
+{
+  float sumX = 0.0f;
+  float sumY = 0.0f;
+
+  Serial.println("Calibrating gyro. Keep MPU6050 still...");
+  for (uint16_t i = 0; i < CALIBRATION_SAMPLES; ++i)
+  {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    sumX += g.gyro.x;
+    sumY += g.gyro.y;
+    delay(4);
+  }
+
+  gyroBiasX = sumX / CALIBRATION_SAMPLES;
+  gyroBiasY = sumY / CALIBRATION_SAMPLES;
+  Serial.println("Gyro calibration complete.");
+}
 
 void setup(void)
 {
   Serial.begin(115200);
-  while (!Serial)
-    delay(10); // will pause Zero, Leonardo, etc until serial console opens
+  delay(200);
 
-  Serial.println("Adafruit MPU6050 test!");
+  Serial.println("ESP32 MPU BLE Mouse starting...");
 
-  // Try to initialize!
   if (!mpu.begin())
   {
     Serial.println("Failed to find MPU6050 chip");
-    while (1)
+    while (true)
     {
       delay(10);
     }
   }
-  Serial.println("MPU6050 Found!");
 
-  // setupt motion detection
-  mpu.setHighPassFilter(MPU6050_HIGHPASS_0_63_HZ);
-  mpu.setMotionDetectionThreshold(1);
-  mpu.setMotionDetectionDuration(20);
-  mpu.setInterruptPinLatch(true); // Keep it latched.  Will turn off when reinitialized.
-  mpu.setInterruptPinPolarity(true);
-  mpu.setMotionInterrupt(true);
+  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
-  Serial.println("");
-  delay(100);
+  calibrateGyro();
+
+  bleMouse.begin();
+  Serial.println("Pair to device: ESP32 MPU Mouse");
 }
 
 void loop()
 {
+  static uint32_t lastSampleMs = 0;
+  static uint32_t lastStatusMs = 0;
+  const uint32_t nowMs = millis();
 
-  if (mpu.getMotionInterruptStatus())
+  if (nowMs - lastSampleMs < 10)
   {
-    /* Get new sensor events with the readings */
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
+    return;
+  }
+  lastSampleMs = nowMs;
 
-    /* Compute orientation (roll, pitch) from accelerometer and convert to degrees */
-    constexpr float RAD_TO_DEG_F = 57.29577951308232f;
-    float roll = atan2(a.acceleration.y, a.acceleration.z) * RAD_TO_DEG_F;
-    float pitch = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * RAD_TO_DEG_F;
-
-    /* Convert gyro (rad/s) to degrees/s for easier reading */
-    float gyroX_deg = g.gyro.x * RAD_TO_DEG_F;
-    float gyroY_deg = g.gyro.y * RAD_TO_DEG_F;
-    float gyroZ_deg = g.gyro.z * RAD_TO_DEG_F;
-
-    /* Print out the values in a clearer, degree-based format */
-    Serial.print("AccelX:");
-    Serial.print(a.acceleration.x);
-    Serial.print(", ");
-    Serial.print("AccelY:");
-    Serial.print(a.acceleration.y);
-    Serial.print(", ");
-    Serial.print("AccelZ:");
-    Serial.print(a.acceleration.z);
-    Serial.println();
-
-    Serial.print("Roll(deg):");
-    Serial.print(roll);
-    Serial.print(", ");
-    Serial.print("Pitch(deg):");
-    Serial.print(pitch);
-    Serial.println();
-
-    Serial.print("GyroX(deg/s):");
-    Serial.print(gyroX_deg);
-    Serial.print(", ");
-    Serial.print("GyroY(deg/s):");
-    Serial.print(gyroY_deg);
-    Serial.print(", ");
-    Serial.print("GyroZ(deg/s):");
-    Serial.print(gyroZ_deg);
-    Serial.println();
+  if (!bleMouse.isConnected())
+  {
+    if (nowMs - lastStatusMs > 1000)
+    {
+      Serial.println("Waiting for BLE mouse connection...");
+      lastStatusMs = nowMs;
+    }
+    return;
   }
 
-  delay(10);
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  float gyroXDps = (g.gyro.y - gyroBiasY) * RAD_TO_DEG_F;
+  float gyroYDps = (g.gyro.x - gyroBiasX) * RAD_TO_DEG_F;
+
+  gyroXDps = applyDeadband(gyroXDps, GYRO_DEADBAND_DPS);
+  gyroYDps = applyDeadband(gyroYDps, GYRO_DEADBAND_DPS);
+
+  filteredDpsX = (1.0f - SMOOTHING_ALPHA) * filteredDpsX + SMOOTHING_ALPHA * gyroXDps;
+  filteredDpsY = (1.0f - SMOOTHING_ALPHA) * filteredDpsY + SMOOTHING_ALPHA * gyroYDps;
+
+  int moveX = static_cast<int>(roundf(filteredDpsX * GYRO_TO_MOUSE_GAIN));
+  int moveY = static_cast<int>(roundf(-filteredDpsY * GYRO_TO_MOUSE_GAIN));
+
+  moveX = constrain(moveX, -127, 127);
+  moveY = constrain(moveY, -127, 127);
+
+  if (moveX != 0 || moveY != 0)
+  {
+    bleMouse.move(static_cast<int8_t>(moveX), static_cast<int8_t>(moveY));
+  }
+
+  if (nowMs - lastStatusMs > 1000)
+  {
+    Serial.print("Connected | dpsX=");
+    Serial.print(filteredDpsX, 2);
+    Serial.print(" dpsY=");
+    Serial.println(filteredDpsY, 2);
+    lastStatusMs = nowMs;
+  }
 }
