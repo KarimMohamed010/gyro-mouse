@@ -15,6 +15,11 @@ constexpr float SMOOTHING_ALPHA = 0.28f;
 constexpr uint16_t CALIBRATION_SAMPLES = 400;
 constexpr uint16_t BLE_POST_CONNECT_DELAY_MS = 1200;
 constexpr uint16_t BLE_REPORT_INTERVAL_MS = 16;
+constexpr uint8_t PIN_BTN_LEFT = 34;
+constexpr uint8_t PIN_BTN_RIGHT = 35;
+constexpr uint8_t PIN_BTN_SCROLL_DOWN = 33;
+constexpr uint16_t BUTTON_DEBOUNCE_MS = 40;
+constexpr uint16_t SCROLL_REPEAT_MS = 120;
 
 float gyroBiasX = 0.0f;
 float gyroBiasY = 0.0f;
@@ -55,6 +60,11 @@ void setup(void)
   Serial.begin(115200);
   delay(200);
 
+  // GPIO34 is input-only and needs an external pull-up or pull-down resistor.
+  pinMode(PIN_BTN_LEFT, INPUT);
+  pinMode(PIN_BTN_RIGHT, INPUT_PULLUP);
+  pinMode(PIN_BTN_SCROLL_DOWN, INPUT_PULLUP);
+
   Serial.println("ESP32 MPU BLE Mouse starting...");
 
   if (!mpu.begin())
@@ -83,6 +93,12 @@ void loop()
   static uint32_t lastAdvertiseKickMs = 0;
   static uint32_t connectedSinceMs = 0;
   static uint32_t lastReportMs = 0;
+  static uint32_t lastLeftClickMs = 0;
+  static uint32_t lastRightClickMs = 0;
+  static uint32_t lastScrollStepMs = 0;
+  static bool leftWasPressed = false;
+  static bool rightWasPressed = false;
+  static bool scrollWasPressed = false;
   static bool wasConnected = false;
   const uint32_t nowMs = millis();
   const bool connected = bleMouse.isConnected();
@@ -138,6 +154,36 @@ void loop()
     }
     return;
   }
+
+  const bool leftPressed = (digitalRead(PIN_BTN_LEFT) == LOW);
+  const bool rightPressed = (digitalRead(PIN_BTN_RIGHT) == LOW);
+  const bool scrollPressed = (digitalRead(PIN_BTN_SCROLL_DOWN) == LOW);
+
+  if (leftPressed && !leftWasPressed && (nowMs - lastLeftClickMs >= BUTTON_DEBOUNCE_MS))
+  {
+    bleMouse.click(MOUSE_LEFT);
+    lastLeftClickMs = nowMs;
+  }
+
+  if (rightPressed && !rightWasPressed && (nowMs - lastRightClickMs >= BUTTON_DEBOUNCE_MS))
+  {
+    bleMouse.click(MOUSE_RIGHT);
+    lastRightClickMs = nowMs;
+  }
+
+  if (scrollPressed)
+  {
+    const uint32_t repeatMs = scrollWasPressed ? SCROLL_REPEAT_MS : BUTTON_DEBOUNCE_MS;
+    if (nowMs - lastScrollStepMs >= repeatMs)
+    {
+      bleMouse.move(0, 0, -1);
+      lastScrollStepMs = nowMs;
+    }
+  }
+
+  leftWasPressed = leftPressed;
+  rightWasPressed = rightPressed;
+  scrollWasPressed = scrollPressed;
 
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
