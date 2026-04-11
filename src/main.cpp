@@ -1,133 +1,139 @@
 #include <Arduino.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
 #include <Wire.h>
 #include <BleMouse.h>
 #include <BLEDevice.h>
 
-Adafruit_MPU6050 mpu;
-BleMouse bleMouse("ESP32 MPU Mouse", "Espressif", 100);
+// ── Hardware ──────────────────────────────────────────────────────────────────
+constexpr uint8_t INTERRUPT_PIN = 2; // MPU6050 INT → GPIO2
 
-constexpr float RAD_TO_DEG_F = 57.29577951308232f;
-constexpr float GYRO_DEADBAND_DPS = 1.6f;
-constexpr float GYRO_TO_MOUSE_GAIN = 0.3f;
-constexpr float SMOOTHING_ALPHA = 0.28f;
-constexpr uint16_t CALIBRATION_SAMPLES = 400;
+// ── Tuning ────────────────────────────────────────────────────────────────────
+constexpr float ANGLE_DEADBAND_DEG = 1.5f;       // ignore angles within this range of zero
+constexpr float ANGLE_TO_MOUSE_GAIN = 0.3f;      // angle (deg) → mouse counts per frame
+constexpr float YAW_CLICK_THRESHOLD_DEG = 30.0f; // yaw past this → left/right click
+constexpr uint16_t CLICK_REARM_MS = 600;         // min time before same click can fire again
 constexpr uint16_t BLE_POST_CONNECT_DELAY_MS = 1200;
 constexpr uint16_t BLE_REPORT_INTERVAL_MS = 16;
-constexpr uint8_t PIN_BTN_LEFT = 34;
-constexpr uint8_t PIN_BTN_RIGHT = 35;
-constexpr uint8_t PIN_BTN_SCROLL_DOWN = 39;
-constexpr uint16_t BUTTON_DEBOUNCE_MS = 40;
-constexpr uint16_t SCROLL_REPEAT_MS = 120;
 
-float gyroBiasX = 0.0f;
-float gyroBiasY = 0.0f;
-float filteredDpsX = 0.0f;
-float filteredDpsY = 0.0f;
+// ── Objects ───────────────────────────────────────────────────────────────────
+MPU6050 mpu;
+BleMouse bleMouse("ESP32 MPU Mouse", "Espressif", 100);
 
-float applyDeadband(float value, float deadband)
+// ── DMP state ─────────────────────────────────────────────────────────────────
+bool dmpReady = false;
+uint8_t devStatus;
+uint16_t packetSize;
+uint8_t fifoBuffer[64];
+
+Quaternion q;
+VectorFloat gravity;
+float ypr[3]; // [yaw, pitch, roll] in radians
+
+volatile bool mpuInterrupt = false;
+void IRAM_ATTR dmpDataReady() { mpuInterrupt = true; }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+inline float applyDeadband(float v, float db)
 {
-  if (fabsf(value) < deadband)
-  {
-    return 0.0f;
-  }
-  return value;
+  return (fabsf(v) < db) ? 0.0f : v;
 }
 
-void calibrateGyro()
+// ── Setup ─────────────────────────────────────────────────────────────────────
+void setup()
 {
-  float sumX = 0.0f;
-  float sumY = 0.0f;
+  Wire.begin();
+  Wire.setClock(400000);
 
-  Serial.println("Calibrating gyro. Keep MPU6050 still...");
-  for (uint16_t i = 0; i < CALIBRATION_SAMPLES; ++i)
-  {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-    sumX += g.gyro.x;
-    sumY += g.gyro.y;
-    delay(4);
-  }
-
-  gyroBiasX = sumX / CALIBRATION_SAMPLES;
-  gyroBiasY = sumY / CALIBRATION_SAMPLES;
-  Serial.println("Gyro calibration complete.");
-}
-
-void setup(void)
-{
   Serial.begin(115200);
-  delay(200);
+  while (!Serial)
+    ;
 
-  // GPIO34 is input-only and needs an external pull-up or pull-down resistor.
-  pinMode(PIN_BTN_LEFT, INPUT);
-  pinMode(PIN_BTN_RIGHT, INPUT_PULLUP);
-  pinMode(PIN_BTN_SCROLL_DOWN, INPUT_PULLUP);
+  pinMode(INTERRUPT_PIN, INPUT);
 
-  Serial.println("ESP32 MPU BLE Mouse starting...");
+  Serial.println("Initializing MPU6050...");
+  mpu.initialize();
 
-  if (!mpu.begin())
+  if (!mpu.testConnection())
   {
-    Serial.println("Failed to find MPU6050 chip");
+    Serial.println("MPU6050 connection failed — halting.");
     while (true)
-    {
-      delay(10);
-    }
+      ;
   }
+  Serial.println("MPU6050 connection OK.");
 
-  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.println("Initializing DMP...");
+  devStatus = mpu.dmpInitialize();
 
-  calibrateGyro();
+  // Zero out offsets — CalibrateAccel/Gyro will find the real values
+  mpu.setXGyroOffset(0);
+  mpu.setYGyroOffset(0);
+  mpu.setZGyroOffset(0);
+  mpu.setXAccelOffset(0);
+  mpu.setYAccelOffset(0);
+  mpu.setZAccelOffset(0);
+
+  if (devStatus == 0)
+  {
+    // Auto-calibration: keep MPU6050 flat and still during this ~2 s window
+    Serial.println("Auto-calibrating — keep sensor still...");
+    mpu.CalibrateAccel(6);
+    mpu.CalibrateGyro(6);
+    Serial.println("Calibration done. Active offsets:");
+    mpu.PrintActiveOffsets();
+
+    mpu.setDMPEnabled(true);
+    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
+    dmpReady = true;
+    packetSize = mpu.dmpGetFIFOPacketSize();
+    Serial.println("DMP ready.");
+  }
+  else
+  {
+    Serial.print("DMP init failed (code ");
+    Serial.print(devStatus);
+    Serial.println("). Halting.");
+    while (true)
+      ;
+  }
 
   bleMouse.begin();
-  Serial.println("Pair to device: ESP32 MPU Mouse");
+  Serial.println("BLE advertising as: ESP32 MPU Mouse");
 }
 
+// ── Loop ──────────────────────────────────────────────────────────────────────
 void loop()
 {
-  static uint32_t lastSampleMs = 0;
+  if (!dmpReady)
+    return;
+
   static uint32_t lastStatusMs = 0;
   static uint32_t lastAdvertiseKickMs = 0;
   static uint32_t connectedSinceMs = 0;
   static uint32_t lastReportMs = 0;
   static uint32_t lastLeftClickMs = 0;
   static uint32_t lastRightClickMs = 0;
-  static uint32_t lastScrollStepMs = 0;
-  static bool leftWasPressed = false;
-  static bool rightWasPressed = false;
-  static bool scrollWasPressed = false;
+  static bool yawLeftArmed = true;  // ready to fire left click
+  static bool yawRightArmed = true; // ready to fire right click
   static bool wasConnected = false;
+
   const uint32_t nowMs = millis();
   const bool connected = bleMouse.isConnected();
 
+  // ── Connection bookkeeping ─────────────────────────────────────────────────
   if (connected && !wasConnected)
   {
     connectedSinceMs = nowMs;
     lastReportMs = nowMs;
     Serial.println("BLE connected.");
   }
-
   if (!connected && wasConnected)
   {
     BLEDevice::startAdvertising();
-    filteredDpsX = 0.0f;
-    filteredDpsY = 0.0f;
-    connectedSinceMs = 0;
-    lastReportMs = 0;
     lastAdvertiseKickMs = nowMs;
-    Serial.println("BLE disconnected. Re-advertising for any host...");
+    Serial.println("BLE disconnected. Re-advertising...");
   }
-
   wasConnected = connected;
-
-  if (nowMs - lastSampleMs < 10)
-  {
-    return;
-  }
-  lastSampleMs = nowMs;
 
   if (!connected)
   {
@@ -136,10 +142,9 @@ void loop()
       BLEDevice::startAdvertising();
       lastAdvertiseKickMs = nowMs;
     }
-
     if (nowMs - lastStatusMs > 1000)
     {
-      Serial.println("Waiting for BLE mouse connection...");
+      Serial.println("Waiting for BLE connection...");
       lastStatusMs = nowMs;
     }
     return;
@@ -149,59 +154,60 @@ void loop()
   {
     if (nowMs - lastStatusMs > 1000)
     {
-      Serial.println("BLE link up. Waiting for HID notifications to be ready...");
+      Serial.println("Link up — waiting for HID to be ready...");
       lastStatusMs = nowMs;
     }
     return;
   }
 
-  const bool leftPressed = (digitalRead(PIN_BTN_LEFT) == LOW);
-  const bool rightPressed = (digitalRead(PIN_BTN_RIGHT) == LOW);
-  const bool scrollPressed = (digitalRead(PIN_BTN_SCROLL_DOWN) == LOW);
+  // ── DMP packet → orientation ──────────────────────────────────────────────
+  if (!mpu.dmpGetCurrentFIFOPacket(fifoBuffer))
+    return;
 
-  if (leftPressed && !leftWasPressed && (nowMs - lastLeftClickMs >= BUTTON_DEBOUNCE_MS))
-  {
-    bleMouse.click(MOUSE_LEFT);
-    lastLeftClickMs = nowMs;
-  }
+  mpu.dmpGetQuaternion(&q, fifoBuffer);
+  mpu.dmpGetGravity(&gravity, &q);
+  mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
-  if (rightPressed && !rightWasPressed && (nowMs - lastRightClickMs >= BUTTON_DEBOUNCE_MS))
-  {
-    bleMouse.click(MOUSE_RIGHT);
-    lastRightClickMs = nowMs;
-  }
+  // ypr[0]=yaw, ypr[1]=pitch, ypr[2]=roll (radians)
+  const float yaw = ypr[0] * RAD_TO_DEG;
+  const float pitch = applyDeadband(ypr[1] * RAD_TO_DEG, ANGLE_DEADBAND_DEG);
+  const float roll = applyDeadband(ypr[2] * RAD_TO_DEG, ANGLE_DEADBAND_DEG);
 
-  if (scrollPressed)
+  // ── Yaw tilt → clicks (one-shot, re-arms when returned past threshold) ────
+  // Tilt left  (yaw < -threshold) → left click
+  // Tilt right (yaw >  threshold) → right click
+  if (yaw < -YAW_CLICK_THRESHOLD_DEG)
   {
-    const uint32_t repeatMs = scrollWasPressed ? SCROLL_REPEAT_MS : BUTTON_DEBOUNCE_MS;
-    if (nowMs - lastScrollStepMs >= repeatMs)
+    if (yawLeftArmed && (nowMs - lastLeftClickMs >= CLICK_REARM_MS))
     {
-      bleMouse.move(0, 0, -1);
-      lastScrollStepMs = nowMs;
+      bleMouse.click(MOUSE_LEFT);
+      lastLeftClickMs = nowMs;
+      yawLeftArmed = false;
     }
   }
+  else
+  {
+    yawLeftArmed = true; // re-arm once back inside threshold
+  }
 
-  leftWasPressed = leftPressed;
-  rightWasPressed = rightPressed;
-  scrollWasPressed = scrollPressed;
+  if (yaw > YAW_CLICK_THRESHOLD_DEG)
+  {
+    if (yawRightArmed && (nowMs - lastRightClickMs >= CLICK_REARM_MS))
+    {
+      bleMouse.click(MOUSE_RIGHT);
+      lastRightClickMs = nowMs;
+      yawRightArmed = false;
+    }
+  }
+  else
+  {
+    yawRightArmed = true;
+  }
 
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+  // ── Cursor movement ───────────────────────────────────────────────────────
 
-  float gyroXDps = (g.gyro.y - gyroBiasY) * RAD_TO_DEG_F;
-  float gyroYDps = (g.gyro.x - gyroBiasX) * RAD_TO_DEG_F;
-
-  gyroXDps = applyDeadband(gyroXDps, GYRO_DEADBAND_DPS);
-  gyroYDps = applyDeadband(gyroYDps, GYRO_DEADBAND_DPS);
-
-  filteredDpsX = (1.0f - SMOOTHING_ALPHA) * filteredDpsX + SMOOTHING_ALPHA * gyroXDps;
-  filteredDpsY = (1.0f - SMOOTHING_ALPHA) * filteredDpsY + SMOOTHING_ALPHA * gyroYDps;
-
-  int moveX = static_cast<int>(roundf(filteredDpsX * GYRO_TO_MOUSE_GAIN));
-  int moveY = static_cast<int>(roundf(-filteredDpsY * GYRO_TO_MOUSE_GAIN));
-
-  moveX = constrain(moveX, -127, 127);
-  moveY = constrain(moveY, -127, 127);
+  const int moveX = constrain(static_cast<int>(roundf(roll * ANGLE_TO_MOUSE_GAIN)), -127, 127);
+  const int moveY = constrain(static_cast<int>(roundf(-pitch * ANGLE_TO_MOUSE_GAIN)), -127, 127);
 
   if ((moveX != 0 || moveY != 0) && (nowMs - lastReportMs >= BLE_REPORT_INTERVAL_MS))
   {
@@ -211,10 +217,12 @@ void loop()
 
   if (nowMs - lastStatusMs > 1000)
   {
-    Serial.print("Connected | dpsX=");
-    Serial.print(filteredDpsX, 2);
-    Serial.print(" dpsY=");
-    Serial.println(filteredDpsY, 2);
+    Serial.print("yaw=");
+    Serial.print(yaw, 2);
+    Serial.print(" pitch=");
+    Serial.print(pitch, 2);
+    Serial.print(" roll=");
+    Serial.println(roll, 2);
     lastStatusMs = nowMs;
   }
 }
