@@ -56,14 +56,26 @@ constexpr int kWindowSize = 100;
 
 #if !HAS_FEATURE_NORM_HEADER
 constexpr float kFeatureMean[kFeatureCount] = {
-    0.f, 0.f, 0.f,
-    0.f, 0.f, 0.f,
-    0.f, 0.f, 0.f,
+    0.f,
+    0.f,
+    0.f,
+    0.f,
+    0.f,
+    0.f,
+    0.f,
+    0.f,
+    0.f,
 };
 constexpr float kFeatureStd[kFeatureCount] = {
-    1.f, 1.f, 1.f,
-    1.f, 1.f, 1.f,
-    1.f, 1.f, 1.f,
+    1.f,
+    1.f,
+    1.f,
+    1.f,
+    1.f,
+    1.f,
+    1.f,
+    1.f,
+    1.f,
 };
 #endif
 
@@ -113,7 +125,8 @@ struct Config
 // ── Helpers ───────────────────────────────────────────────────────────────────
 inline int8_t signOf(float v)
 {
-  return (v > 0.f) ? 1 : (v < 0.f) ? -1 : 0;
+  return (v > 0.f) ? 1 : (v < 0.f) ? -1
+                                   : 0;
 }
 
 inline float applyDeadband(float v, float db)
@@ -452,223 +465,223 @@ float ypr[3] = {0.f, 0.f, 0.f};
 
 namespace ml_gestures
 {
-float featureBuffer[kWindowSize][kFeatureCount] = {};
-int ringWriteIndex = 0;
-int bufferedSamples = 0;
-uint16_t samplesSinceInference = 0;
+  float featureBuffer[kWindowSize][kFeatureCount] = {};
+  int ringWriteIndex = 0;
+  int bufferedSamples = 0;
+  uint16_t samplesSinceInference = 0;
 
 #if HAS_TFLM
-// ── TensorFlow Lite Micro state ─────────────────────────────────────────────
-constexpr size_t kTensorArenaSize = 120 * 1024;
-alignas(16) static uint8_t tensorArena[kTensorArenaSize];
+  // ── TensorFlow Lite Micro state ─────────────────────────────────────────────
+  constexpr size_t kTensorArenaSize = 120 * 1024;
+  alignas(16) static uint8_t tensorArena[kTensorArenaSize];
 
-tflite::MicroErrorReporter microErrorReporter;
-const tflite::Model *model = nullptr;
-tflite::MicroInterpreter *interpreter = nullptr;
-TfLiteTensor *inputTensor = nullptr;
-TfLiteTensor *outputTensor = nullptr;
+  tflite::MicroErrorReporter microErrorReporter;
+  const tflite::Model *model = nullptr;
+  tflite::MicroInterpreter *interpreter = nullptr;
+  TfLiteTensor *inputTensor = nullptr;
+  TfLiteTensor *outputTensor = nullptr;
 
-bool tflmReady = false;
-bool tflmWarned = false;
+  bool tflmReady = false;
+  bool tflmWarned = false;
 
-inline float normalizeFeature(int idx, float value)
-{
-  const float s = kFeatureStd[idx];
-  return (s > 1e-6f) ? ((value - kFeatureMean[idx]) / s) : (value - kFeatureMean[idx]);
-}
-
-bool setupTFLM()
-{
-  model = tflite::GetModel(g_gesture_model_data);
-  if (!model)
+  inline float normalizeFeature(int idx, float value)
   {
-    Serial.println("TFLM model pointer is null.");
-    return false;
-  }
-  if (model->version() != TFLITE_SCHEMA_VERSION)
-  {
-    Serial.println("TFLM model schema version mismatch.");
-    return false;
+    const float s = kFeatureStd[idx];
+    return (s > 1e-6f) ? ((value - kFeatureMean[idx]) / s) : (value - kFeatureMean[idx]);
   }
 
-  static tflite::MicroMutableOpResolver<18> opResolver;
-  opResolver.AddReshape();
-  opResolver.AddConv2D();
-  opResolver.AddDepthwiseConv2D();
-  opResolver.AddFullyConnected();
-  opResolver.AddSoftmax();
-  opResolver.AddMean();
-  opResolver.AddMul();
-  opResolver.AddAdd();
-  opResolver.AddQuantize();
-  opResolver.AddDequantize();
-  opResolver.AddRelu();
-  opResolver.AddPad();
-  opResolver.AddPack();
-  opResolver.AddStridedSlice();
-  opResolver.AddExpandDims();
-  opResolver.AddSqueeze();
-  opResolver.AddMaxPool2D();
-  opResolver.AddLogistic();
-
-  static tflite::MicroInterpreter staticInterpreter(model, opResolver, tensorArena, kTensorArenaSize, &microErrorReporter);
-  interpreter = &staticInterpreter;
-
-  if (interpreter->AllocateTensors() != kTfLiteOk)
+  bool setupTFLM()
   {
-    Serial.println("AllocateTensors failed.");
-    return false;
-  }
-
-  inputTensor = interpreter->input(0);
-  outputTensor = interpreter->output(0);
-
-  if (!inputTensor || !outputTensor)
-  {
-    Serial.println("Input/output tensor missing.");
-    return false;
-  }
-
-  Serial.print("TFLM ready. Arena bytes: ");
-  Serial.println(kTensorArenaSize);
-  return true;
-}
-
-void fillModelInputFromRing()
-{
-  const int inputElements = inputTensor->bytes / ((inputTensor->type == kTfLiteFloat32) ? sizeof(float) : sizeof(int8_t));
-  const int expectedElements = kWindowSize * kFeatureCount;
-  if (inputElements != expectedElements)
-  {
-    if (!tflmWarned)
+    model = tflite::GetModel(g_gesture_model_data);
+    if (!model)
     {
-      Serial.print("Input shape mismatch. expected=");
-      Serial.print(expectedElements);
-      Serial.print(" got=");
-      Serial.println(inputElements);
-      tflmWarned = true;
+      Serial.println("TFLM model pointer is null.");
+      return false;
     }
-    return;
+    if (model->version() != TFLITE_SCHEMA_VERSION)
+    {
+      Serial.println("TFLM model schema version mismatch.");
+      return false;
+    }
+
+    static tflite::MicroMutableOpResolver<18> opResolver;
+    opResolver.AddReshape();
+    opResolver.AddConv2D();
+    opResolver.AddDepthwiseConv2D();
+    opResolver.AddFullyConnected();
+    opResolver.AddSoftmax();
+    opResolver.AddMean();
+    opResolver.AddMul();
+    opResolver.AddAdd();
+    opResolver.AddQuantize();
+    opResolver.AddDequantize();
+    opResolver.AddRelu();
+    opResolver.AddPad();
+    opResolver.AddPack();
+    opResolver.AddStridedSlice();
+    opResolver.AddExpandDims();
+    opResolver.AddSqueeze();
+    opResolver.AddMaxPool2D();
+    opResolver.AddLogistic();
+
+    static tflite::MicroInterpreter staticInterpreter(model, opResolver, tensorArena, kTensorArenaSize, &microErrorReporter);
+    interpreter = &staticInterpreter;
+
+    if (interpreter->AllocateTensors() != kTfLiteOk)
+    {
+      Serial.println("AllocateTensors failed.");
+      return false;
+    }
+
+    inputTensor = interpreter->input(0);
+    outputTensor = interpreter->output(0);
+
+    if (!inputTensor || !outputTensor)
+    {
+      Serial.println("Input/output tensor missing.");
+      return false;
+    }
+
+    Serial.print("TFLM ready. Arena bytes: ");
+    Serial.println(kTensorArenaSize);
+    return true;
   }
 
-  int flatIdx = 0;
-  const int oldestIndex = (ringWriteIndex + kWindowSize - bufferedSamples) % kWindowSize;
-
-  for (int i = 0; i < kWindowSize; i++)
+  void fillModelInputFromRing()
   {
-    const int srcIdx = (oldestIndex + i) % kWindowSize;
-    for (int f = 0; f < kFeatureCount; f++)
+    const int inputElements = inputTensor->bytes / ((inputTensor->type == kTfLiteFloat32) ? sizeof(float) : sizeof(int8_t));
+    const int expectedElements = kWindowSize * kFeatureCount;
+    if (inputElements != expectedElements)
     {
-      const float normalized = normalizeFeature(f, featureBuffer[srcIdx][f]);
-      if (inputTensor->type == kTfLiteFloat32)
+      if (!tflmWarned)
       {
-        inputTensor->data.f[flatIdx] = normalized;
+        Serial.print("Input shape mismatch. expected=");
+        Serial.print(expectedElements);
+        Serial.print(" got=");
+        Serial.println(inputElements);
+        tflmWarned = true;
       }
-      else if (inputTensor->type == kTfLiteInt8)
+      return;
+    }
+
+    int flatIdx = 0;
+    const int oldestIndex = (ringWriteIndex + kWindowSize - bufferedSamples) % kWindowSize;
+
+    for (int i = 0; i < kWindowSize; i++)
+    {
+      const int srcIdx = (oldestIndex + i) % kWindowSize;
+      for (int f = 0; f < kFeatureCount; f++)
       {
-        const float invScale = 1.0f / inputTensor->params.scale;
-        int32_t qv = static_cast<int32_t>(roundf(normalized * invScale) + inputTensor->params.zero_point);
-        if (qv > 127)
-          qv = 127;
-        if (qv < -128)
-          qv = -128;
-        inputTensor->data.int8[flatIdx] = static_cast<int8_t>(qv);
+        const float normalized = normalizeFeature(f, featureBuffer[srcIdx][f]);
+        if (inputTensor->type == kTfLiteFloat32)
+        {
+          inputTensor->data.f[flatIdx] = normalized;
+        }
+        else if (inputTensor->type == kTfLiteInt8)
+        {
+          const float invScale = 1.0f / inputTensor->params.scale;
+          int32_t qv = static_cast<int32_t>(roundf(normalized * invScale) + inputTensor->params.zero_point);
+          if (qv > 127)
+            qv = 127;
+          if (qv < -128)
+            qv = -128;
+          inputTensor->data.int8[flatIdx] = static_cast<int8_t>(qv);
+        }
+        flatIdx++;
       }
-      flatIdx++;
     }
   }
-}
 
-void runInferenceAndPrint()
-{
-  if (!tflmReady)
-    return;
-  if (bufferedSamples < kWindowSize)
-    return;
-
-  fillModelInputFromRing();
-
-  if (interpreter->Invoke() != kTfLiteOk)
+  void runInferenceAndPrint()
   {
-    Serial.println("Inference failed.");
-    return;
-  }
+    if (!tflmReady)
+      return;
+    if (bufferedSamples < kWindowSize)
+      return;
 
-  const int outCount = outputTensor->dims->data[outputTensor->dims->size - 1];
-  if (outCount <= 0)
-    return;
+    fillModelInputFromRing();
 
-  int bestIdx = 0;
-  float bestScore = -1.0f;
-  for (int i = 0; i < outCount; i++)
-  {
-    float score = 0.f;
-    if (outputTensor->type == kTfLiteFloat32)
+    if (interpreter->Invoke() != kTfLiteOk)
     {
-      score = outputTensor->data.f[i];
-    }
-    else if (outputTensor->type == kTfLiteInt8)
-    {
-      score = (static_cast<int32_t>(outputTensor->data.int8[i]) - outputTensor->params.zero_point) * outputTensor->params.scale;
-    }
-    else if (outputTensor->type == kTfLiteUInt8)
-    {
-      score = (static_cast<int32_t>(outputTensor->data.uint8[i]) - outputTensor->params.zero_point) * outputTensor->params.scale;
+      Serial.println("Inference failed.");
+      return;
     }
 
-    if (score > bestScore)
-    {
-      bestScore = score;
-      bestIdx = i;
-    }
-  }
+    const int outCount = outputTensor->dims->data[outputTensor->dims->size - 1];
+    if (outCount <= 0)
+      return;
 
-  Serial.print("ml_gestures,");
-  if (bestIdx >= 0 && bestIdx < kMlLabelCount)
-  {
-    Serial.print(kMlGestureLabels[bestIdx]);
+    int bestIdx = 0;
+    float bestScore = -1.0f;
+    for (int i = 0; i < outCount; i++)
+    {
+      float score = 0.f;
+      if (outputTensor->type == kTfLiteFloat32)
+      {
+        score = outputTensor->data.f[i];
+      }
+      else if (outputTensor->type == kTfLiteInt8)
+      {
+        score = (static_cast<int32_t>(outputTensor->data.int8[i]) - outputTensor->params.zero_point) * outputTensor->params.scale;
+      }
+      else if (outputTensor->type == kTfLiteUInt8)
+      {
+        score = (static_cast<int32_t>(outputTensor->data.uint8[i]) - outputTensor->params.zero_point) * outputTensor->params.scale;
+      }
+
+      if (score > bestScore)
+      {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+
+    Serial.print("ml_gestures,");
+    if (bestIdx >= 0 && bestIdx < kMlLabelCount)
+    {
+      Serial.print(kMlGestureLabels[bestIdx]);
+    }
+    else
+    {
+      Serial.print("class_");
+      Serial.print(bestIdx);
+    }
+    Serial.print(",");
+    Serial.println(bestScore, 4);
   }
-  else
-  {
-    Serial.print("class_");
-    Serial.print(bestIdx);
-  }
-  Serial.print(",");
-  Serial.println(bestScore, 4);
-}
 #endif
 
-void pushFeatureSample(const float sample[kFeatureCount])
-{
-  for (int i = 0; i < kFeatureCount; i++)
-    featureBuffer[ringWriteIndex][i] = sample[i];
+  void pushFeatureSample(const float sample[kFeatureCount])
+  {
+    for (int i = 0; i < kFeatureCount; i++)
+      featureBuffer[ringWriteIndex][i] = sample[i];
 
-  ringWriteIndex = (ringWriteIndex + 1) % kWindowSize;
-  if (bufferedSamples < kWindowSize)
-    bufferedSamples++;
-  samplesSinceInference++;
-}
+    ringWriteIndex = (ringWriteIndex + 1) % kWindowSize;
+    if (bufferedSamples < kWindowSize)
+      bufferedSamples++;
+    samplesSinceInference++;
+  }
 
-void setup()
-{
+  void setup()
+  {
 #if HAS_TFLM
-  tflmReady = setupTFLM();
+    tflmReady = setupTFLM();
 #else
-  Serial.println("ml_gestures: TensorFlow Lite Micro headers not found. Disabled.");
+    Serial.println("ml_gestures: TensorFlow Lite Micro headers not found. Disabled.");
 #endif
-}
-
-void onSample(const float sample[kFeatureCount])
-{
-  pushFeatureSample(sample);
-#if HAS_TFLM
-  if (samplesSinceInference >= INFERENCE_STRIDE_SAMPLES)
-  {
-    runInferenceAndPrint();
-    samplesSinceInference = 0;
   }
+
+  void onSample(const float sample[kFeatureCount])
+  {
+    pushFeatureSample(sample);
+#if HAS_TFLM
+    if (samplesSinceInference >= INFERENCE_STRIDE_SAMPLES)
+    {
+      runInferenceAndPrint();
+      samplesSinceInference = 0;
+    }
 #endif
-}
+  }
 } // namespace ml_gestures
 
 volatile bool mpuInterrupt = false;
