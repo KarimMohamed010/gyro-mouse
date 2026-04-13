@@ -54,10 +54,12 @@ python train_gesture_models.py \
 - `training_artifacts/preprocessing/label_classes.json`
 - `training_artifacts/lstm/lstm.keras`
 - `training_artifacts/lstm/lstm.tflite`
+- `training_artifacts/lstm/lstm_int8.tflite`
 - `training_artifacts/lstm/confusion_matrix.csv`
 - `training_artifacts/lstm/confusion_matrix.png` (if matplotlib available)
 - `training_artifacts/cnn1d/cnn1d.keras`
 - `training_artifacts/cnn1d/cnn1d.tflite`
+- `training_artifacts/cnn1d/cnn1d_int8.tflite`
 - `training_artifacts/cnn1d/confusion_matrix.csv`
 - `training_artifacts/cnn1d/confusion_matrix.png` (if matplotlib available)
 - `training_artifacts/metrics_summary.json`

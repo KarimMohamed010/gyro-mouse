@@ -12,6 +12,7 @@ from gesture_training.data import load_and_window_dataset
 from gesture_training.evaluate import (
     evaluate_model,
     export_tflite,
+    export_tflite_int8,
     save_confusion_matrix,
     save_confusion_matrix_plot,
 )
@@ -137,6 +138,7 @@ def main() -> int:
 
         model.save(model_dir / f"{model_name}.keras")
         export_tflite(model, model_dir / f"{model_name}.tflite")
+        export_tflite_int8(model, representative_data=x_train_n, out_file=model_dir / f"{model_name}_int8.tflite")
 
         save_confusion_matrix(cm, class_names, model_dir / "confusion_matrix.csv")
         plotted = save_confusion_matrix_plot(cm, class_names, model_dir / "confusion_matrix.png")
@@ -151,6 +153,7 @@ def main() -> int:
             "confusion_matrix_png": str((model_dir / "confusion_matrix.png").resolve()) if plotted else None,
             "keras_model": str((model_dir / f"{model_name}.keras").resolve()),
             "tflite_model": str((model_dir / f"{model_name}.tflite").resolve()),
+            "tflite_int8_model": str((model_dir / f"{model_name}_int8.tflite").resolve()),
         }
 
     with (out_dir / "metrics_summary.json").open("w", encoding="utf-8") as f:

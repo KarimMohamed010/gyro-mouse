@@ -65,3 +65,24 @@ def export_tflite(model, out_file: Path) -> None:
     converter = __import__("tensorflow").lite.TFLiteConverter.from_keras_model(model)
     tflite_data = converter.convert()
     out_file.write_bytes(tflite_data)
+
+
+def export_tflite_int8(model, representative_data: np.ndarray, out_file: Path) -> None:
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        tf = __import__("tensorflow")
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+        def representative_dataset_gen():
+            max_items = min(300, representative_data.shape[0])
+            for i in range(max_items):
+                sample = representative_data[i : i + 1].astype(np.float32)
+                yield [sample]
+
+        converter.representative_dataset = representative_dataset_gen
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.inference_input_type = tf.int8
+        converter.inference_output_type = tf.int8
+
+        tflite_data = converter.convert()
+        out_file.write_bytes(tflite_data)
