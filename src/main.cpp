@@ -59,6 +59,12 @@ struct Config
   float shakeVelThresh = 60.0f;
   float doubleTiltDeg = 25.0f;
   float circleMinSpeed = 20.0f;
+
+  // Gesture enable switches
+  bool enableFlick = true;
+  bool enableShake = true;
+  bool enableDoubleTilt = true;
+  bool enableCircle = true;
 } cfg;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -128,138 +134,186 @@ void detectGestures(uint32_t nowMs)
   const bool onCooldown = (nowMs - gs.lastGestureMs) < GESTURE_COOLDOWN_MS;
 
   // ── Flick (arm + return-to-origin confirm) ────────────────────────────────
-  for (int i = 0; i < 3; i++)
+  if (cfg.enableFlick)
   {
-    auto &fa = gs.flick[i];
-    if (fa.phase == 0)
+    for (int i = 0; i < 3; i++)
     {
-      if (fabsf(vel[i]) > cfg.flickVelThresh)
+      auto &fa = gs.flick[i];
+      if (fa.phase == 0)
       {
-        fa.phase = 1;
-        fa.direction = signOf(vel[i]);
-        fa.originAngle = axes[i];
-        fa.armedMs = nowMs;
+        if (fabsf(vel[i]) > cfg.flickVelThresh)
+        {
+          fa.phase = 1;
+          fa.direction = signOf(vel[i]);
+          fa.originAngle = axes[i];
+          fa.armedMs = nowMs;
+        }
+      }
+      else
+      {
+        if (nowMs - fa.armedMs > cfg.flickConfirmMs)
+        {
+          fa.phase = 0;
+        }
+        else if (fabsf(axes[i] - fa.originAngle) < cfg.flickReturnDeg)
+        {
+          if (!onCooldown)
+          {
+            Serial.print("{\"gesture\":\"Flick\",\"axis\":\"");
+            Serial.print(fa.direction > 0 ? AXIS_POS[i] : AXIS_NEG[i]);
+            Serial.println("\"}");
+            gs.lastGestureMs = nowMs;
+          }
+          fa.phase = 0;
+        }
       }
     }
-    else
+  }
+  else
+  {
+    for (int i = 0; i < 3; i++)
     {
-      if (nowMs - fa.armedMs > cfg.flickConfirmMs)
-      {
-        fa.phase = 0;
-      }
-      else if (fabsf(axes[i] - fa.originAngle) < cfg.flickReturnDeg)
-      {
-        if (!onCooldown)
-        {
-          Serial.print("{\"gesture\":\"Flick\",\"axis\":\"");
-          Serial.print(fa.direction > 0 ? AXIS_POS[i] : AXIS_NEG[i]);
-          Serial.println("\"}");
-          gs.lastGestureMs = nowMs;
-        }
-        fa.phase = 0;
-      }
+      gs.flick[i].phase = 0;
+      gs.flick[i].direction = 0;
+      gs.flick[i].originAngle = 0.f;
+      gs.flick[i].armedMs = 0;
     }
   }
 
   // ── Shake ─────────────────────────────────────────────────────────────────
-  for (int i = 0; i < 2; i++)
-  { // yaw + roll only (pitch = click axis)
-    const int8_t s = signOf(vel[i]);
-    if (s == 0 || fabsf(vel[i]) < cfg.shakeVelThresh)
-      continue;
-    if (s != gs.shakeSign[i] && gs.shakeSign[i] != 0)
-    {
-      if (gs.shakeCount[i] == 0)
-        gs.shakeStartMs = nowMs;
-      if (nowMs - gs.shakeStartMs < SHAKE_WINDOW_MS)
-      {
-        gs.shakeCount[i]++;
-        if (gs.shakeCount[i] >= SHAKE_REVERSALS_REQUIRED && !onCooldown)
-        {
-          Serial.print("{\"gesture\":\"Shake\",\"axis\":\"");
-          Serial.print(AXIS_NAMES[i]);
-          Serial.println("\"}");
-          gs.lastGestureMs = nowMs;
-          gs.shakeCount[i] = 0;
-        }
-      }
-      else
-      {
-        gs.shakeCount[i] = 1;
-        gs.shakeStartMs = nowMs;
-      }
-    }
-    gs.shakeSign[i] = s;
-  }
-
-  // ── Double-tilt ───────────────────────────────────────────────────────────
-  for (int i = 0; i < 3; i++)
+  if (cfg.enableShake)
   {
-    for (int d = 0; d < 2; d++)
-    {
-      const float thresh = (d == 0) ? -cfg.doubleTiltDeg : cfg.doubleTiltDeg;
-      const bool over = (d == 0) ? (axes[i] < thresh) : (axes[i] > thresh);
-      if (over)
+    for (int i = 0; i < 2; i++)
+    { // yaw + roll only (pitch = click axis)
+      const int8_t s = signOf(vel[i]);
+      if (s == 0 || fabsf(vel[i]) < cfg.shakeVelThresh)
+        continue;
+      if (s != gs.shakeSign[i] && gs.shakeSign[i] != 0)
       {
-        if (!gs.doubleTiltArmed[i][d])
-          continue;
-        if (gs.doubleTiltFirstMs[i][d] == 0)
+        if (gs.shakeCount[i] == 0)
+          gs.shakeStartMs = nowMs;
+        if (nowMs - gs.shakeStartMs < SHAKE_WINDOW_MS)
         {
-          gs.doubleTiltFirstMs[i][d] = nowMs;
-        }
-        else if ((nowMs - gs.doubleTiltFirstMs[i][d]) < DOUBLE_TILT_WINDOW_MS)
-        {
-          if (!onCooldown)
+          gs.shakeCount[i]++;
+          if (gs.shakeCount[i] >= SHAKE_REVERSALS_REQUIRED && !onCooldown)
           {
-            Serial.print("{\"gesture\":\"DoubleTilt\",\"axis\":\"");
-            Serial.print(d == 0 ? AXIS_NEG[i] : AXIS_POS[i]);
+            Serial.print("{\"gesture\":\"Shake\",\"axis\":\"");
+            Serial.print(AXIS_NAMES[i]);
             Serial.println("\"}");
             gs.lastGestureMs = nowMs;
+            gs.shakeCount[i] = 0;
           }
-          gs.doubleTiltFirstMs[i][d] = 0;
         }
         else
         {
-          gs.doubleTiltFirstMs[i][d] = nowMs;
+          gs.shakeCount[i] = 1;
+          gs.shakeStartMs = nowMs;
         }
-        gs.doubleTiltArmed[i][d] = false;
       }
-      else
+      gs.shakeSign[i] = s;
+    }
+  }
+  else
+  {
+    for (int i = 0; i < 3; i++)
+    {
+      gs.shakeSign[i] = 0;
+      gs.shakeCount[i] = 0;
+    }
+    gs.shakeStartMs = 0;
+  }
+
+  // ── Double-tilt ───────────────────────────────────────────────────────────
+  if (cfg.enableDoubleTilt)
+  {
+    for (int i = 0; i < 3; i++)
+    {
+      for (int d = 0; d < 2; d++)
       {
-        gs.doubleTiltArmed[i][d] = true;
-        if (fabsf(axes[i]) < cfg.doubleTiltDeg * 0.5f &&
-            gs.doubleTiltFirstMs[i][d] != 0 &&
-            (nowMs - gs.doubleTiltFirstMs[i][d]) >= DOUBLE_TILT_WINDOW_MS)
+        const float thresh = (d == 0) ? -cfg.doubleTiltDeg : cfg.doubleTiltDeg;
+        const bool over = (d == 0) ? (axes[i] < thresh) : (axes[i] > thresh);
+        if (over)
         {
-          gs.doubleTiltFirstMs[i][d] = 0;
+          if (!gs.doubleTiltArmed[i][d])
+            continue;
+          if (gs.doubleTiltFirstMs[i][d] == 0)
+          {
+            gs.doubleTiltFirstMs[i][d] = nowMs;
+          }
+          else if ((nowMs - gs.doubleTiltFirstMs[i][d]) < DOUBLE_TILT_WINDOW_MS)
+          {
+            if (!onCooldown)
+            {
+              Serial.print("{\"gesture\":\"DoubleTilt\",\"axis\":\"");
+              Serial.print(d == 0 ? AXIS_NEG[i] : AXIS_POS[i]);
+              Serial.println("\"}");
+              gs.lastGestureMs = nowMs;
+            }
+            gs.doubleTiltFirstMs[i][d] = 0;
+          }
+          else
+          {
+            gs.doubleTiltFirstMs[i][d] = nowMs;
+          }
+          gs.doubleTiltArmed[i][d] = false;
         }
+        else
+        {
+          gs.doubleTiltArmed[i][d] = true;
+          if (fabsf(axes[i]) < cfg.doubleTiltDeg * 0.5f &&
+              gs.doubleTiltFirstMs[i][d] != 0 &&
+              (nowMs - gs.doubleTiltFirstMs[i][d]) >= DOUBLE_TILT_WINDOW_MS)
+          {
+            gs.doubleTiltFirstMs[i][d] = 0;
+          }
+        }
+      }
+    }
+  }
+  else
+  {
+    for (int i = 0; i < 3; i++)
+    {
+      for (int d = 0; d < 2; d++)
+      {
+        gs.doubleTiltFirstMs[i][d] = 0;
+        gs.doubleTiltArmed[i][d] = false;
       }
     }
   }
 
   // ── Circle (cursor X + Y axes moving 90° out of phase) ───────────────────
+  if (cfg.enableCircle)
   {
-    const uint8_t a = cfg.cursorXAxis;
-    const uint8_t b = cfg.cursorYAxis;
-    if (fabsf(vel[a]) > cfg.circleMinSpeed && fabsf(vel[b]) > cfg.circleMinSpeed)
     {
-      const int8_t sa = signOf(vel[a]);
-      const int8_t sb = signOf(vel[b]);
-      if (sa != gs.circleSignA || sb != gs.circleSignB)
-        gs.circleFrames++;
-      gs.circleSignA = sa;
-      gs.circleSignB = sb;
-      if (gs.circleFrames >= CIRCLE_FRAMES_REQUIRED && !onCooldown)
+      const uint8_t a = cfg.cursorXAxis;
+      const uint8_t b = cfg.cursorYAxis;
+      if (fabsf(vel[a]) > cfg.circleMinSpeed && fabsf(vel[b]) > cfg.circleMinSpeed)
       {
-        Serial.println("{\"gesture\":\"Circle\"}");
-        gs.lastGestureMs = nowMs;
+        const int8_t sa = signOf(vel[a]);
+        const int8_t sb = signOf(vel[b]);
+        if (sa != gs.circleSignA || sb != gs.circleSignB)
+          gs.circleFrames++;
+        gs.circleSignA = sa;
+        gs.circleSignB = sb;
+        if (gs.circleFrames >= CIRCLE_FRAMES_REQUIRED && !onCooldown)
+        {
+          Serial.println("{\"gesture\":\"Circle\"}");
+          gs.lastGestureMs = nowMs;
+          gs.circleFrames = 0;
+        }
+      }
+      else
+      {
         gs.circleFrames = 0;
       }
     }
-    else
-    {
-      gs.circleFrames = 0;
-    }
+  }
+  else
+  {
+    gs.circleFrames = 0;
+    gs.circleSignA = 0;
+    gs.circleSignB = 0;
   }
 }
 
@@ -281,49 +335,57 @@ void handleSerial()
     return;
   }
 
-  StaticJsonDocument<512> doc;
+  JsonDocument doc;
   if (deserializeJson(doc, line) != DeserializationError::Ok)
     return;
-  if (!doc.containsKey("cfg"))
+  if (!doc["cfg"].is<JsonObject>())
     return;
 
-  JsonObject c = doc["cfg"];
-  if (c.containsKey("cursorXAxis"))
-    cfg.cursorXAxis = c["cursorXAxis"];
-  if (c.containsKey("cursorYAxis"))
-    cfg.cursorYAxis = c["cursorYAxis"];
-  if (c.containsKey("clickAxis"))
-    cfg.clickAxis = c["clickAxis"];
-  if (c.containsKey("invertX"))
-    cfg.invertX = c["invertX"];
-  if (c.containsKey("invertY"))
-    cfg.invertY = c["invertY"];
-  if (c.containsKey("invertClick"))
-    cfg.invertClick = c["invertClick"];
-  if (c.containsKey("deadzoneX"))
-    cfg.deadzoneX = c["deadzoneX"];
-  if (c.containsKey("deadzoneY"))
-    cfg.deadzoneY = c["deadzoneY"];
-  if (c.containsKey("deadzoneClick"))
-    cfg.deadzoneClick = c["deadzoneClick"];
-  if (c.containsKey("gainX"))
-    cfg.gainX = c["gainX"];
-  if (c.containsKey("gainY"))
-    cfg.gainY = c["gainY"];
-  if (c.containsKey("clickThreshDeg"))
-    cfg.clickThreshDeg = c["clickThreshDeg"];
-  if (c.containsKey("flickVelThresh"))
-    cfg.flickVelThresh = c["flickVelThresh"];
-  if (c.containsKey("flickReturnDeg"))
-    cfg.flickReturnDeg = c["flickReturnDeg"];
-  if (c.containsKey("flickConfirmMs"))
-    cfg.flickConfirmMs = c["flickConfirmMs"];
-  if (c.containsKey("shakeVelThresh"))
-    cfg.shakeVelThresh = c["shakeVelThresh"];
-  if (c.containsKey("doubleTiltDeg"))
-    cfg.doubleTiltDeg = c["doubleTiltDeg"];
-  if (c.containsKey("circleMinSpeed"))
-    cfg.circleMinSpeed = c["circleMinSpeed"];
+  JsonObject c = doc["cfg"].as<JsonObject>();
+  if (c["cursorXAxis"].is<uint8_t>())
+    cfg.cursorXAxis = c["cursorXAxis"].as<uint8_t>();
+  if (c["cursorYAxis"].is<uint8_t>())
+    cfg.cursorYAxis = c["cursorYAxis"].as<uint8_t>();
+  if (c["clickAxis"].is<uint8_t>())
+    cfg.clickAxis = c["clickAxis"].as<uint8_t>();
+  if (c["invertX"].is<bool>())
+    cfg.invertX = c["invertX"].as<bool>();
+  if (c["invertY"].is<bool>())
+    cfg.invertY = c["invertY"].as<bool>();
+  if (c["invertClick"].is<bool>())
+    cfg.invertClick = c["invertClick"].as<bool>();
+  if (c["deadzoneX"].is<float>())
+    cfg.deadzoneX = c["deadzoneX"].as<float>();
+  if (c["deadzoneY"].is<float>())
+    cfg.deadzoneY = c["deadzoneY"].as<float>();
+  if (c["deadzoneClick"].is<float>())
+    cfg.deadzoneClick = c["deadzoneClick"].as<float>();
+  if (c["gainX"].is<float>())
+    cfg.gainX = c["gainX"].as<float>();
+  if (c["gainY"].is<float>())
+    cfg.gainY = c["gainY"].as<float>();
+  if (c["clickThreshDeg"].is<float>())
+    cfg.clickThreshDeg = c["clickThreshDeg"].as<float>();
+  if (c["flickVelThresh"].is<float>())
+    cfg.flickVelThresh = c["flickVelThresh"].as<float>();
+  if (c["flickReturnDeg"].is<float>())
+    cfg.flickReturnDeg = c["flickReturnDeg"].as<float>();
+  if (c["flickConfirmMs"].is<uint16_t>())
+    cfg.flickConfirmMs = c["flickConfirmMs"].as<uint16_t>();
+  if (c["shakeVelThresh"].is<float>())
+    cfg.shakeVelThresh = c["shakeVelThresh"].as<float>();
+  if (c["doubleTiltDeg"].is<float>())
+    cfg.doubleTiltDeg = c["doubleTiltDeg"].as<float>();
+  if (c["circleMinSpeed"].is<float>())
+    cfg.circleMinSpeed = c["circleMinSpeed"].as<float>();
+  if (c["enableFlick"].is<bool>())
+    cfg.enableFlick = c["enableFlick"].as<bool>();
+  if (c["enableShake"].is<bool>())
+    cfg.enableShake = c["enableShake"].as<bool>();
+  if (c["enableDoubleTilt"].is<bool>())
+    cfg.enableDoubleTilt = c["enableDoubleTilt"].as<bool>();
+  if (c["enableCircle"].is<bool>())
+    cfg.enableCircle = c["enableCircle"].as<bool>();
 
   Serial.println("{\"ack\":\"cfg\"}");
 }

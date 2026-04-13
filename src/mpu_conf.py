@@ -21,6 +21,8 @@ DEFAULT_CFG = {
     "clickThreshDeg": 30.0,
     "flickVelThresh": 120.0, "flickReturnDeg": 8.0, "flickConfirmMs": 300,
     "shakeVelThresh": 60.0, "doubleTiltDeg": 25.0, "circleMinSpeed": 20.0,
+    "enableFlick": True, "enableShake": True,
+    "enableDoubleTilt": True, "enableCircle": True,
 }
 
 C = {
@@ -413,6 +415,32 @@ class App(tk.Tk):
     def _build_gestures(self, p):
         p.columnconfigure(0, weight=1)
         self.thresh_sliders = {}
+
+        # Per-gesture enable switches
+        self.gesture_toggle_vars = {}
+        toggles = tk.Frame(p, bg=C["bg1"])
+        toggles.pack(fill="x", pady=(0, 6))
+        toggles.columnconfigure(0, weight=1)
+        toggles.columnconfigure(1, weight=1)
+        toggle_specs = [
+            ("enableFlick", "Enable Flick"),
+            ("enableShake", "Enable Shake"),
+            ("enableDoubleTilt", "Enable Double-Tilt"),
+            ("enableCircle", "Enable Circle"),
+        ]
+        for i, (key, label) in enumerate(toggle_specs):
+            var = tk.BooleanVar(value=self.cfg.get(key, True))
+            cb = tk.Checkbutton(
+                toggles, text=label, variable=var,
+                bg=C["bg1"], fg=C["text1"], selectcolor=C["bg3"],
+                activebackground=C["bg1"], font=FONT_TINY,
+                relief="flat", bd=0, highlightthickness=0,
+            )
+            cb.grid(row=i // 2, column=i % 2, sticky="w", pady=1, padx=(0, 8))
+            self.gesture_toggle_vars[key] = var
+
+        tk.Frame(p, bg=C["border"], height=1).pack(fill="x", pady=(2, 6))
+
         specs = [
             ("clickThreshDeg","Click angle",    "°",    5,  90,  0.5),
             ("flickVelThresh","Flick speed",    "°/s", 40, 400,  5.0),
@@ -503,6 +531,8 @@ class App(tk.Tk):
             v.set(AXIS_NAMES[min(self.cfg.get(k,0), len(AXIS_NAMES)-1)])
         for k, v in self.invert_vars.items():
             v.set(self.cfg.get(k, False))
+        for k, v in self.gesture_toggle_vars.items():
+            v.set(self.cfg.get(k, True))
         for k, sl in self.dead_sliders.items():
             val = self.cfg.get(k, 1.5); sl.set(val); self.dead_vizzes[k].set_dead(val)
         for k, sl in self.gain_sliders.items():
@@ -515,6 +545,7 @@ class App(tk.Tk):
             try: self.cfg[k] = AXIS_NAMES.index(v.get())
             except ValueError: pass
         for k, v in self.invert_vars.items():  self.cfg[k] = v.get()
+        for k, v in self.gesture_toggle_vars.items(): self.cfg[k] = v.get()
         for k, sl in self.dead_sliders.items(): self.cfg[k] = sl.get()
         for k, sl in self.gain_sliders.items(): self.cfg[k] = sl.get()
         for k, sl in self.thresh_sliders.items(): self.cfg[k] = sl.get()
