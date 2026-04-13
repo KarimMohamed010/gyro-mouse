@@ -18,7 +18,7 @@ constexpr uint16_t SHAKE_WINDOW_MS = 800;
 constexpr uint16_t DOUBLE_TILT_WINDOW_MS = 500;
 constexpr uint8_t SHAKE_REVERSALS_REQUIRED = 4;
 constexpr uint8_t CIRCLE_FRAMES_REQUIRED = 12;
-constexpr uint16_t SERIAL_STREAM_INTERVAL_MS = 50; // 20 Hz live data to GUI
+constexpr uint16_t SERIAL_STREAM_INTERVAL_MS = 20; // ~50 Hz IMU stream for recorder
 
 // ── Axis indices ──────────────────────────────────────────────────────────────
 // The DMP gives us yaw/pitch/roll. We expose them as A0/A1/A2 to the config.
@@ -401,6 +401,8 @@ uint8_t fifoBuffer[64];
 Quaternion q;
 VectorFloat gravity;
 float ypr[3];
+VectorInt16 aa;
+VectorInt16 gg;
 
 volatile bool mpuInterrupt = false;
 void IRAM_ATTR dmpDataReady() { mpuInterrupt = true; }
@@ -504,15 +506,16 @@ void loop()
       Serial.println("Waiting for BLE...");
       lastStatusMs = nowMs;
     }
-    return;
   }
-  if ((nowMs - connectedSinceMs) < BLE_POST_CONNECT_DELAY_MS)
-    return;
+
+  const bool mouseReportsEnabled = connected && ((nowMs - connectedSinceMs) >= BLE_POST_CONNECT_DELAY_MS);
 
   // ── Read DMP ──────────────────────────────────────────────────────────────
   if (!mpu.dmpGetCurrentFIFOPacket(fifoBuffer))
     return;
   mpu.dmpGetQuaternion(&q, fifoBuffer);
+  mpu.dmpGetAccel(&aa, fifoBuffer);
+  mpu.dmpGetGyro(&gg, fifoBuffer);
   mpu.dmpGetGravity(&gravity, &q);
   mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
@@ -521,16 +524,26 @@ void loop()
   axes[AXIS_PITCH] = ypr[1] * RAD_TO_DEG;
   axes[AXIS_ROLL] = ypr[2] * RAD_TO_DEG;
 
-  // ── Live stream to GUI ────────────────────────────────────────────────────
+  // ── Live stream for recorder: ax,ay,az,gx,gy,gz,yaw,pitch,roll ──────────
   if (nowMs - lastStreamMs >= SERIAL_STREAM_INTERVAL_MS)
   {
-    Serial.print("{\"a\":[");
-    Serial.print(axes[0], 2);
+    Serial.print(aa.x);
     Serial.print(",");
-    Serial.print(axes[1], 2);
+    Serial.print(aa.y);
     Serial.print(",");
-    Serial.print(axes[2], 2);
-    Serial.println("]}");
+    Serial.print(aa.z);
+    Serial.print(",");
+    Serial.print(gg.x);
+    Serial.print(",");
+    Serial.print(gg.y);
+    Serial.print(",");
+    Serial.print(gg.z);
+    Serial.print(",");
+    Serial.print(axes[0], 3);
+    Serial.print(",");
+    Serial.print(axes[1], 3);
+    Serial.print(",");
+    Serial.println(axes[2], 3);
     lastStreamMs = nowMs;
   }
 
@@ -547,7 +560,7 @@ void loop()
   detectGestures(nowMs);
 
   // ── Click axis → left / right click ──────────────────────────────────────
-  if (clickV < -cfg.clickThreshDeg)
+  if (mouseReportsEnabled && clickV < -cfg.clickThreshDeg)
   {
     if (clickLeftArmed && (nowMs - lastLeftClickMs >= CLICK_REARM_MS))
     {
@@ -561,7 +574,7 @@ void loop()
     clickLeftArmed = true;
   }
 
-  if (clickV > cfg.clickThreshDeg)
+  if (mouseReportsEnabled && clickV > cfg.clickThreshDeg)
   {
     if (clickRightArmed && (nowMs - lastRightClickMs >= CLICK_REARM_MS))
     {
@@ -579,7 +592,7 @@ void loop()
   const int moveX = constrain(static_cast<int>(roundf(cursorX)), -127, 127);
   const int moveY = constrain(static_cast<int>(roundf(-cursorY)), -127, 127);
 
-  if ((moveX != 0 || moveY != 0) && (nowMs - lastReportMs >= BLE_REPORT_INTERVAL_MS))
+  if (mouseReportsEnabled && (moveX != 0 || moveY != 0) && (nowMs - lastReportMs >= BLE_REPORT_INTERVAL_MS))
   {
     bleMouse.move(static_cast<int8_t>(moveX), static_cast<int8_t>(moveY));
     lastReportMs = nowMs;
