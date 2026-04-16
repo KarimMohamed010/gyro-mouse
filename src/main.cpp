@@ -6,19 +6,30 @@
 #include <BLEDevice.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <esp_heap_caps.h>
+#include <nvs.h>
+
 
 #include "model_data.h"
 
-#if __has_include(<TensorFlowLite.h>)
+#if __has_include(<TensorFlowLite_ESP32.h>)
+#include <TensorFlowLite_ESP32.h>
+#define HAS_TFLM 1
+#elif __has_include(<TensorFlowLite.h>)
 #include <TensorFlowLite.h>
+#define HAS_TFLM 1
+#elif __has_include(<TensorFlow.h>)
+#include <TensorFlow.h>
+#define HAS_TFLM 1
+#else
+#define HAS_TFLM 0
+#endif
+
+#if HAS_TFLM
 #include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
-#include "tensorflow/lite/version.h"
-#define HAS_TFLM 1
-#else
-#define HAS_TFLM 0
 #endif
 
 // ── Hardware ──────────────────────────────────────────────────────────────────
@@ -31,7 +42,7 @@ constexpr uint16_t CLICK_REARM_MS = 600;
 constexpr uint16_t GESTURE_COOLDOWN_MS = 800;
 constexpr uint16_t SHAKE_WINDOW_MS = 800;
 constexpr uint16_t DOUBLE_TILT_WINDOW_MS = 500;
-constexpr uint8_t SHAKE_REVERSALS_REQUIRED = 4;
+constexpr uint8_t SHAKE_REVERSALS_REQUIRED = 2;
 constexpr uint8_t CIRCLE_FRAMES_REQUIRED = 12;
 
 // ── Streaming and inference settings ─────────────────────────────────────────
@@ -124,6 +135,31 @@ struct Config
 } cfg;
 
 Preferences prefs;
+Preferences sysPrefs;
+
+void clearLegacyBtConfigOnce()
+{
+  sysPrefs.begin("sys", false);
+  const bool btConfigCleared = sysPrefs.getBool("bt_cfg_reset", false);
+  if (btConfigCleared)
+  {
+    sysPrefs.end();
+    return;
+  }
+
+  nvs_handle_t btCfgHandle;
+  esp_err_t openErr = nvs_open("bt_config", NVS_READWRITE, &btCfgHandle);
+  if (openErr == ESP_OK)
+  {
+    nvs_erase_all(btCfgHandle);
+    nvs_commit(btCfgHandle);
+    nvs_close(btCfgHandle);
+    Serial.println("Cleared stale bt_config namespace.");
+  }
+
+  sysPrefs.putBool("bt_cfg_reset", true);
+  sysPrefs.end();
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 inline int8_t signOf(float v)
@@ -496,6 +532,7 @@ float ypr[3] = {0.f, 0.f, 0.f};
 
 namespace ml_gestures
 {
+  bool setupDone = false;
   float featureBuffer[kWindowSize][kFeatureCount] = {};
   int ringWriteIndex = 0;
   int bufferedSamples = 0;
@@ -503,8 +540,11 @@ namespace ml_gestures
 
 #if HAS_TFLM
   // ── TensorFlow Lite Micro state ─────────────────────────────────────────────
-  constexpr size_t kTensorArenaSize = 120 * 1024;
-  alignas(16) static uint8_t tensorArena[kTensorArenaSize];
+  constexpr size_t kTensorArenaPreferredSize = 120 * 1024;
+  constexpr size_t kTensorArenaMinSize = 64 * 1024;
+  constexpr size_t kTensorArenaStepSize = 4 * 1024;
+  uint8_t *tensorArena = nullptr;
+  size_t tensorArenaSize = 0;
 
   tflite::MicroErrorReporter microErrorReporter;
   const tflite::Model *model = nullptr;
@@ -523,6 +563,42 @@ namespace ml_gestures
 
   bool setupTFLM()
   {
+    if (!tensorArena)
+    {
+      const size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+      const size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+
+      Serial.print("Heap free (8-bit): ");
+      Serial.println(freeHeap);
+      Serial.print("Largest free block: ");
+      Serial.println(largestBlock);
+
+      size_t maxCandidate = kTensorArenaPreferredSize;
+      if (largestBlock < maxCandidate)
+        maxCandidate = largestBlock;
+      maxCandidate = (maxCandidate / kTensorArenaStepSize) * kTensorArenaStepSize;
+
+      for (size_t candidate = maxCandidate; candidate >= kTensorArenaMinSize; candidate -= kTensorArenaStepSize)
+      {
+        uint8_t *buf = static_cast<uint8_t *>(heap_caps_malloc(candidate, MALLOC_CAP_8BIT));
+        if (buf)
+        {
+          tensorArena = buf;
+          tensorArenaSize = candidate;
+          break;
+        }
+
+        if (candidate == kTensorArenaMinSize)
+          break;
+      }
+
+      if (!tensorArena)
+      {
+        Serial.println("Failed to allocate tensor arena.");
+        return false;
+      }
+    }
+
     model = tflite::GetModel(g_gesture_model_data);
     if (!model)
     {
@@ -535,27 +611,19 @@ namespace ml_gestures
       return false;
     }
 
-    static tflite::MicroMutableOpResolver<18> opResolver;
+    // Keep only ops required by the current embedded CNN INT8 model.
+    static tflite::MicroMutableOpResolver<9> opResolver;
     opResolver.AddReshape();
     opResolver.AddConv2D();
-    opResolver.AddDepthwiseConv2D();
     opResolver.AddFullyConnected();
     opResolver.AddSoftmax();
     opResolver.AddMean();
     opResolver.AddMul();
     opResolver.AddAdd();
-    opResolver.AddQuantize();
-    opResolver.AddDequantize();
-    opResolver.AddRelu();
-    opResolver.AddPad();
-    opResolver.AddPack();
-    opResolver.AddStridedSlice();
     opResolver.AddExpandDims();
-    opResolver.AddSqueeze();
     opResolver.AddMaxPool2D();
-    opResolver.AddLogistic();
 
-    static tflite::MicroInterpreter staticInterpreter(model, opResolver, tensorArena, kTensorArenaSize, &microErrorReporter);
+    static tflite::MicroInterpreter staticInterpreter(model, opResolver, tensorArena, tensorArenaSize, &microErrorReporter);
     interpreter = &staticInterpreter;
 
     if (interpreter->AllocateTensors() != kTfLiteOk)
@@ -574,13 +642,16 @@ namespace ml_gestures
     }
 
     Serial.print("TFLM ready. Arena bytes: ");
-    Serial.println(kTensorArenaSize);
+    Serial.println(tensorArenaSize);
     return true;
   }
 
-  void fillModelInputFromRing()
+  bool fillModelInputFromRing()
   {
-    const int inputElements = inputTensor->bytes / ((inputTensor->type == kTfLiteFloat32) ? sizeof(float) : sizeof(int8_t));
+    int valueSize = sizeof(int8_t);
+    if (inputTensor->type == kTfLiteFloat32)
+      valueSize = sizeof(float);
+    const int inputElements = inputTensor->bytes / valueSize;
     const int expectedElements = kWindowSize * kFeatureCount;
     if (inputElements != expectedElements)
     {
@@ -592,7 +663,30 @@ namespace ml_gestures
         Serial.println(inputElements);
         tflmWarned = true;
       }
-      return;
+      return false;
+    }
+
+    if (inputTensor->type != kTfLiteFloat32 && inputTensor->type != kTfLiteInt8 && inputTensor->type != kTfLiteUInt8)
+    {
+      if (!tflmWarned)
+      {
+        Serial.print("Unsupported input tensor type: ");
+        Serial.println(static_cast<int>(inputTensor->type));
+        tflmWarned = true;
+      }
+      return false;
+    }
+
+    const float scale = inputTensor->params.scale;
+    const bool quantizedInput = (inputTensor->type == kTfLiteInt8 || inputTensor->type == kTfLiteUInt8);
+    if (quantizedInput && fabsf(scale) < 1e-12f)
+    {
+      if (!tflmWarned)
+      {
+        Serial.println("Invalid input quantization scale (0).");
+        tflmWarned = true;
+      }
+      return false;
     }
 
     int flatIdx = 0;
@@ -610,7 +704,7 @@ namespace ml_gestures
         }
         else if (inputTensor->type == kTfLiteInt8)
         {
-          const float invScale = 1.0f / inputTensor->params.scale;
+          const float invScale = 1.0f / scale;
           int32_t qv = static_cast<int32_t>(roundf(normalized * invScale) + inputTensor->params.zero_point);
           if (qv > 127)
             qv = 127;
@@ -618,9 +712,21 @@ namespace ml_gestures
             qv = -128;
           inputTensor->data.int8[flatIdx] = static_cast<int8_t>(qv);
         }
+        else if (inputTensor->type == kTfLiteUInt8)
+        {
+          const float invScale = 1.0f / scale;
+          int32_t qv = static_cast<int32_t>(roundf(normalized * invScale) + inputTensor->params.zero_point);
+          if (qv > 255)
+            qv = 255;
+          if (qv < 0)
+            qv = 0;
+          inputTensor->data.uint8[flatIdx] = static_cast<uint8_t>(qv);
+        }
         flatIdx++;
       }
     }
+
+    return true;
   }
 
   void runInferenceAndPrint()
@@ -630,7 +736,8 @@ namespace ml_gestures
     if (bufferedSamples < kWindowSize)
       return;
 
-    fillModelInputFromRing();
+    if (!fillModelInputFromRing())
+      return;
 
     if (interpreter->Invoke() != kTfLiteOk)
     {
@@ -695,11 +802,14 @@ namespace ml_gestures
 
   void setup()
   {
+    if (setupDone)
+      return;
 #if HAS_TFLM
     tflmReady = setupTFLM();
 #else
     Serial.println("ml_gestures: TensorFlow Lite Micro headers not found. Disabled.");
 #endif
+    setupDone = true;
   }
 
   void onSample(const float sample[kFeatureCount])
@@ -766,9 +876,9 @@ void setup()
       ;
   }
 
+  clearLegacyBtConfigOnce();
   bleMouse.begin();
   Serial.println("BLE advertising as: ESP32 MPU Mouse");
-  ml_gestures::setup();
 
   Serial.println("Output format:");
   Serial.println("  RAW: ax,ay,az,gx,gy,gz,yaw,pitch,roll");
@@ -800,6 +910,10 @@ void loop()
     connectedSinceMs = nowMs;
     lastReportMs = nowMs;
     Serial.println("BLE connected.");
+    if (!ml_gestures::setupDone)
+    {
+      ml_gestures::setup();
+    }
   }
   if (!connected && wasConnected)
   {
@@ -811,11 +925,6 @@ void loop()
 
   if (!connected)
   {
-    if (nowMs - lastAdvertiseKickMs > 5000)
-    {
-      BLEDevice::startAdvertising();
-      lastAdvertiseKickMs = nowMs;
-    }
     if (nowMs - lastStatusMs > 2000)
     {
       Serial.println("Waiting for BLE...");
@@ -861,13 +970,13 @@ void loop()
   };
 
   // Stream raw features for recording/debugging.
-  Serial.print(sample[0], 3);
+  // Serial.print(sample[0], 3);
   for (int i = 1; i < kFeatureCount; i++)
   {
-    Serial.print(',');
-    Serial.print(sample[i], 3);
+    // Serial.print(',');
+    // Serial.print(sample[i], 3);
   }
-  Serial.println();
+  // Serial.println();
 
   ml_gestures::onSample(sample);
 
