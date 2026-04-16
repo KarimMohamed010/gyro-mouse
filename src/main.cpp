@@ -5,6 +5,7 @@
 #include <BleMouse.h>
 #include <BLEDevice.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 
 #include "model_data.h"
 
@@ -122,6 +123,8 @@ struct Config
   bool enableCircle = true;
 } cfg;
 
+Preferences prefs;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 inline int8_t signOf(float v)
 {
@@ -138,6 +141,25 @@ inline float applyDeadband(float v, float db)
 float axes[3] = {}; // [yaw, pitch, roll] in degrees, updated each frame
 
 inline float getAxis(uint8_t idx) { return axes[idx]; }
+
+// Persistent config helpers (Preferences)
+void saveConfig()
+{
+  prefs.begin("mpu", false);
+  prefs.putBytes("cfg", &cfg, sizeof(cfg));
+  prefs.end();
+}
+
+void loadConfig()
+{
+  prefs.begin("mpu", true);
+  if (prefs.isKey("cfg"))
+  {
+    size_t got = prefs.getBytes("cfg", &cfg, sizeof(cfg));
+    (void)got;
+  }
+  prefs.end();
+}
 
 // ── Gesture state ─────────────────────────────────────────────────────────────
 struct GestureState
@@ -397,6 +419,13 @@ void handleSerial()
   JsonDocument doc;
   if (deserializeJson(doc, line) != DeserializationError::Ok)
     return;
+  // Support explicit save command: {"save":1}
+  if (doc["save"].is<int>() && doc["save"].as<int>() == 1)
+  {
+    saveConfig();
+    Serial.println("{\"ack\":\"saved\"}");
+    return;
+  }
   if (!doc["cfg"].is<JsonObject>())
     return;
 
@@ -446,6 +475,8 @@ void handleSerial()
   if (c["enableCircle"].is<bool>())
     cfg.enableCircle = c["enableCircle"].as<bool>();
 
+  // Auto-save after applying new config so changes persist immediately
+  saveConfig();
   Serial.println("{\"ack\":\"cfg\"}");
 }
 
@@ -694,6 +725,9 @@ void setup()
   Serial.begin(115200);
   while (!Serial)
     ;
+
+  // Load persisted config (if any)
+  loadConfig();
 
   pinMode(INTERRUPT_PIN, INPUT);
 

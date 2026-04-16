@@ -14,7 +14,12 @@ def evaluate_model(model, x_test: np.ndarray, y_test: np.ndarray, class_names: l
 
     acc = accuracy_score(y_test, y_pred)
     cm = confusion_matrix(y_test, y_pred, labels=list(range(len(class_names))))
-    report = classification_report(y_test, y_pred, target_names=class_names, digits=4)
+    report = classification_report(
+    y_test,
+    y_pred,
+    labels=range(len(class_names)),
+    target_names=class_names,
+    digits=4)
     return acc, cm, report
 
 
@@ -70,7 +75,14 @@ def export_tflite(model, out_file: Path) -> None:
 def export_tflite_int8(model, representative_data: np.ndarray, out_file: Path) -> None:
         out_file.parent.mkdir(parents=True, exist_ok=True)
         tf = __import__("tensorflow")
-        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        converter = tf.lite.TFLiteConverter.from_saved_model(...)
+
+        converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS,
+        tf.lite.OpsSet.SELECT_TF_OPS
+        ]
+
+        converter._experimental_lower_tensor_list_ops = False
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
 
         def representative_dataset_gen():
