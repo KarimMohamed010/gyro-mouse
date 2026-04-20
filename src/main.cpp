@@ -193,6 +193,91 @@ static const char *AXIS_NAMES[3] = {"YAW", "PITCH", "ROLL"};
 static const char *AXIS_POS[3] = {"YAW+", "PITCH+", "ROLL+"};
 static const char *AXIS_NEG[3] = {"YAW-", "PITCH-", "ROLL-"};
 
+// ── Serial config parser ─────────────────────────────────────────────────────
+void handleSerial()
+{
+  if (!Serial.available())
+    return;
+
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0)
+    return;
+
+  if (line == "{\"ping\":1}")
+  {
+    Serial.println("{\"pong\":1}");
+    return;
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, line) != DeserializationError::Ok)
+    return;
+  // Support explicit save command: {"save":1}
+  if (doc["save"].is<int>() && doc["save"].as<int>() == 1)
+  {
+    saveConfig();
+    Serial.println("{\"ack\":\"saved\"}");
+    return;
+  }
+  if (!doc["cfg"].is<JsonObject>())
+    return;
+
+  JsonObject c = doc["cfg"].as<JsonObject>();
+  if (c["cursorXAxis"].is<uint8_t>())
+    cfg.cursorXAxis = c["cursorXAxis"].as<uint8_t>();
+  if (c["cursorYAxis"].is<uint8_t>())
+    cfg.cursorYAxis = c["cursorYAxis"].as<uint8_t>();
+  if (c["clickAxis"].is<uint8_t>())
+    cfg.clickAxis = c["clickAxis"].as<uint8_t>();
+  if (c["invertX"].is<bool>())
+    cfg.invertX = c["invertX"].as<bool>();
+  if (c["invertY"].is<bool>())
+    cfg.invertY = c["invertY"].as<bool>();
+  if (c["invertClick"].is<bool>())
+    cfg.invertClick = c["invertClick"].as<bool>();
+  if (c["deadzoneX"].is<float>())
+    cfg.deadzoneX = c["deadzoneX"].as<float>();
+  if (c["deadzoneY"].is<float>())
+    cfg.deadzoneY = c["deadzoneY"].as<float>();
+  if (c["deadzoneClick"].is<float>())
+    cfg.deadzoneClick = c["deadzoneClick"].as<float>();
+  if (c["gainX"].is<float>())
+    cfg.gainX = c["gainX"].as<float>();
+  if (c["gainY"].is<float>())
+    cfg.gainY = c["gainY"].as<float>();
+  if (c["clickThreshDeg"].is<float>())
+    cfg.clickThreshDeg = c["clickThreshDeg"].as<float>();
+  if (c["flickVelThresh"].is<float>())
+    cfg.flickVelThresh = c["flickVelThresh"].as<float>();
+  if (c["flickReturnDeg"].is<float>())
+    cfg.flickReturnDeg = c["flickReturnDeg"].as<float>();
+  if (c["flickConfirmMs"].is<uint16_t>())
+    cfg.flickConfirmMs = c["flickConfirmMs"].as<uint16_t>();
+  if (c["shakeVelThresh"].is<float>())
+    cfg.shakeVelThresh = c["shakeVelThresh"].as<float>();
+  if (c["doubleTiltDeg"].is<float>())
+    cfg.doubleTiltDeg = c["doubleTiltDeg"].as<float>();
+  if (c["circleMinSpeed"].is<float>())
+    cfg.circleMinSpeed = c["circleMinSpeed"].as<float>();
+  if (c["enableFlick"].is<bool>())
+    cfg.enableFlick = c["enableFlick"].as<bool>();
+  if (c["enableShake"].is<bool>())
+    cfg.enableShake = c["enableShake"].as<bool>();
+  if (c["enableDoubleTilt"].is<bool>())
+    cfg.enableDoubleTilt = c["enableDoubleTilt"].as<bool>();
+  if (c["enableCircle"].is<bool>())
+    cfg.enableCircle = c["enableCircle"].as<bool>();
+
+  // Auto-save after applying new config so changes persist immediately
+  saveConfig();
+  Serial.println("{\"ack\":\"cfg\"}");
+}
+
+// ── MPU/DMP objects ─────────────────────────────────────────────────────────
+MPU6050 mpu;
+BleMouse bleMouse("ESP32 MPU Mouse", "Espressif", 100);
+
 void detectGestures(uint32_t nowMs)
 {
   if (gs.prevFrameMs == 0)
@@ -284,6 +369,7 @@ void detectGestures(uint32_t nowMs)
             Serial.print("{\"gesture\":\"Shake\",\"axis\":\"");
             Serial.print(AXIS_NAMES[i]);
             Serial.println("\"}");
+            bleMouse.click(MOUSE_RIGHT);
             gs.lastGestureMs = nowMs;
             gs.shakeCount[i] = 0;
           }
@@ -398,91 +484,6 @@ void detectGestures(uint32_t nowMs)
     gs.circleSignB = 0;
   }
 }
-
-// ── Serial config parser ─────────────────────────────────────────────────────
-void handleSerial()
-{
-  if (!Serial.available())
-    return;
-
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  if (line.length() == 0)
-    return;
-
-  if (line == "{\"ping\":1}")
-  {
-    Serial.println("{\"pong\":1}");
-    return;
-  }
-
-  JsonDocument doc;
-  if (deserializeJson(doc, line) != DeserializationError::Ok)
-    return;
-  // Support explicit save command: {"save":1}
-  if (doc["save"].is<int>() && doc["save"].as<int>() == 1)
-  {
-    saveConfig();
-    Serial.println("{\"ack\":\"saved\"}");
-    return;
-  }
-  if (!doc["cfg"].is<JsonObject>())
-    return;
-
-  JsonObject c = doc["cfg"].as<JsonObject>();
-  if (c["cursorXAxis"].is<uint8_t>())
-    cfg.cursorXAxis = c["cursorXAxis"].as<uint8_t>();
-  if (c["cursorYAxis"].is<uint8_t>())
-    cfg.cursorYAxis = c["cursorYAxis"].as<uint8_t>();
-  if (c["clickAxis"].is<uint8_t>())
-    cfg.clickAxis = c["clickAxis"].as<uint8_t>();
-  if (c["invertX"].is<bool>())
-    cfg.invertX = c["invertX"].as<bool>();
-  if (c["invertY"].is<bool>())
-    cfg.invertY = c["invertY"].as<bool>();
-  if (c["invertClick"].is<bool>())
-    cfg.invertClick = c["invertClick"].as<bool>();
-  if (c["deadzoneX"].is<float>())
-    cfg.deadzoneX = c["deadzoneX"].as<float>();
-  if (c["deadzoneY"].is<float>())
-    cfg.deadzoneY = c["deadzoneY"].as<float>();
-  if (c["deadzoneClick"].is<float>())
-    cfg.deadzoneClick = c["deadzoneClick"].as<float>();
-  if (c["gainX"].is<float>())
-    cfg.gainX = c["gainX"].as<float>();
-  if (c["gainY"].is<float>())
-    cfg.gainY = c["gainY"].as<float>();
-  if (c["clickThreshDeg"].is<float>())
-    cfg.clickThreshDeg = c["clickThreshDeg"].as<float>();
-  if (c["flickVelThresh"].is<float>())
-    cfg.flickVelThresh = c["flickVelThresh"].as<float>();
-  if (c["flickReturnDeg"].is<float>())
-    cfg.flickReturnDeg = c["flickReturnDeg"].as<float>();
-  if (c["flickConfirmMs"].is<uint16_t>())
-    cfg.flickConfirmMs = c["flickConfirmMs"].as<uint16_t>();
-  if (c["shakeVelThresh"].is<float>())
-    cfg.shakeVelThresh = c["shakeVelThresh"].as<float>();
-  if (c["doubleTiltDeg"].is<float>())
-    cfg.doubleTiltDeg = c["doubleTiltDeg"].as<float>();
-  if (c["circleMinSpeed"].is<float>())
-    cfg.circleMinSpeed = c["circleMinSpeed"].as<float>();
-  if (c["enableFlick"].is<bool>())
-    cfg.enableFlick = c["enableFlick"].as<bool>();
-  if (c["enableShake"].is<bool>())
-    cfg.enableShake = c["enableShake"].as<bool>();
-  if (c["enableDoubleTilt"].is<bool>())
-    cfg.enableDoubleTilt = c["enableDoubleTilt"].as<bool>();
-  if (c["enableCircle"].is<bool>())
-    cfg.enableCircle = c["enableCircle"].as<bool>();
-
-  // Auto-save after applying new config so changes persist immediately
-  saveConfig();
-  Serial.println("{\"ack\":\"cfg\"}");
-}
-
-// ── MPU/DMP objects ─────────────────────────────────────────────────────────
-MPU6050 mpu;
-BleMouse bleMouse("ESP32 MPU Mouse", "Espressif", 100);
 
 bool dmpReady = false;
 uint8_t devStatus = 0;
@@ -715,6 +716,7 @@ namespace ml_gestures
   }
 } // namespace ml_gestures
 
+
 volatile bool mpuInterrupt = false;
 void IRAM_ATTR dmpDataReady() { mpuInterrupt = true; }
 
@@ -801,13 +803,10 @@ void loop()
   {
     connectedSinceMs = nowMs;
     lastReportMs = nowMs;
-    Serial.println("BLE connected.");
-  }
-  if (!connected && wasConnected)
-  {
-    BLEDevice::startAdvertising();
-    lastAdvertiseKickMs = nowMs;
-    Serial.println("BLE disconnected. Re-advertising...");
+
+    Serial.println("BLE connected. Recalibrating gyro...");
+
+    Serial.println("Calibration done.");
   }
   wasConnected = connected;
 
@@ -840,6 +839,7 @@ void loop()
   mpu.dmpGetQuaternion(&q, fifoBuffer);
   mpu.dmpGetAccel(&aa, fifoBuffer);
   mpu.dmpGetGyro(&gg, fifoBuffer);
+
   mpu.dmpGetGravity(&gravity, &q);
   mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
@@ -855,6 +855,7 @@ void loop()
       static_cast<float>(aa.x),
       static_cast<float>(aa.y),
       static_cast<float>(aa.z),
+     // new calibration
       static_cast<float>(gg.x),
       static_cast<float>(gg.y),
       static_cast<float>(gg.z),
