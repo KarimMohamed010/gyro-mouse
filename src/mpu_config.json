@@ -20,5 +20,9 @@
   "enableFlick": true,
   "enableShake": true,
   "enableDoubleTilt": true,
-  "enableCircle": true
+  "enableCircle": true,
+  "shortcutFlick": "NONE",
+  "shortcutShake": "ALT+TAB",
+  "shortcutDoubleTilt": "NONE",
+  "shortcutCircle": "NONE"
 }
