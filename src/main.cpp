@@ -1,337 +1,797 @@
 #include <Arduino.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
 #include <Wire.h>
 #include <BleMouse.h>
 #include <BLEDevice.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
 
-Adafruit_MPU6050 mpu;
-BleMouse bleMouse("ESP32 MPU Mouse", "Espressif", 100);
+#include "model_data.h"
 
-// ───────────── CONSTANTS ─────────────
-constexpr float RAD_TO_DEG_F = 57.29577951308232f;
-constexpr float GYRO_DEADBAND_DPS = 1.6f;
-constexpr float GYRO_TO_MOUSE_GAIN = 0.3f;
-constexpr float SMOOTHING_ALPHA = 0.28f;
-constexpr uint16_t CALIBRATION_SAMPLES = 400;
+#if __has_include(<TensorFlowLite.h>)
+#include <TensorFlowLite.h>
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/version.h"
+#define HAS_TFLM 1
+#else
+#define HAS_TFLM 0
+#endif
+
+// ── Hardware ──────────────────────────────────────────────────────────────────
+constexpr uint8_t INTERRUPT_PIN = 2;
+
+// ── Fixed tuning (not user-configurable) ─────────────────────────────────────
 constexpr uint16_t BLE_POST_CONNECT_DELAY_MS = 1200;
 constexpr uint16_t BLE_REPORT_INTERVAL_MS = 16;
+constexpr uint16_t CLICK_REARM_MS = 600;
+constexpr uint16_t GESTURE_COOLDOWN_MS = 800;
+constexpr uint16_t SHAKE_WINDOW_MS = 800;
+constexpr uint16_t DOUBLE_TILT_WINDOW_MS = 500;
+constexpr uint8_t SHAKE_REVERSALS_REQUIRED = 4;
+constexpr uint8_t CIRCLE_FRAMES_REQUIRED = 12;
 
-// ───────────── PINS ─────────────
-constexpr uint8_t PIN_BTN_LEFT = 34;
-constexpr uint8_t PIN_BTN_RIGHT = 35;
-constexpr uint8_t PIN_BTN_GESTURE = 39; // Was scroll-down, now gesture modifier
+// ── Streaming and inference settings ─────────────────────────────────────────
+constexpr uint16_t SERIAL_STREAM_INTERVAL_MS = 20; // ~50 Hz
+constexpr uint16_t INFERENCE_STRIDE_SAMPLES = 10;  // run every 10 new samples
 
-// ───────────── BUTTON TIMING ─────────────
-constexpr uint16_t BUTTON_DEBOUNCE_MS = 40;
+// ── Axis indices ──────────────────────────────────────────────────────────────
+// The DMP gives us yaw/pitch/roll. We expose them as A0/A1/A2 to the config.
+// 0 = yaw, 1 = pitch, 2 = roll
+constexpr uint8_t AXIS_YAW = 0;
+constexpr uint8_t AXIS_PITCH = 1;
+constexpr uint8_t AXIS_ROLL = 2;
 
-// ───────────── GESTURE CONFIG ─────────────
-// Minimum accumulated raw-DPS sum to count as a deliberate swipe
-constexpr float GESTURE_SWIPE_THRESHOLD = 120.0f;
-// Ratio test: dominant axis must be this many times larger than the other
-constexpr float GESTURE_AXIS_RATIO = 1.4f;
-// Max samples we record while gesture button is held (at ~10 ms each ≈ 1 s)
-constexpr uint16_t GESTURE_MAX_SAMPLES = 100;
-// How many direction reversals qualify as a "shake"
-constexpr uint8_t SHAKE_REVERSAL_MIN = 4;
-// Minimum movement to count a reversal segment
-constexpr float SHAKE_SEG_THRESHOLD = 15.0f;
+constexpr int kFeatureCount = 9; // ax,ay,az,gx,gy,gz,yaw,pitch,roll
+constexpr int kWindowSize = 100;
 
-// ───────────── GESTURE BUFFER ─────────────
-// We store raw DPS samples so we can do shape analysis (not just sums)
-struct GestureSample
-{
-  float dpsX;
-  float dpsY;
+#if __has_include("feature_norm.h")
+#include "feature_norm.h"
+#define HAS_FEATURE_NORM_HEADER 1
+#else
+#define HAS_FEATURE_NORM_HEADER 0
+#endif
+
+#if !HAS_FEATURE_NORM_HEADER
+constexpr float kFeatureMean[kFeatureCount] = {
+    0.f,
+    0.f,
+    0.f,
+    0.f,
+    0.f,
+    0.f,
+    0.f,
+    0.f,
+    0.f,
 };
+constexpr float kFeatureStd[kFeatureCount] = {
+    1.f,
+    1.f,
+    1.f,
+    1.f,
+    1.f,
+    1.f,
+    1.f,
+    1.f,
+    1.f,
+};
+#endif
 
-GestureSample gestureBuf[GESTURE_MAX_SAMPLES];
-uint16_t gestureLen = 0;
+constexpr const char *kMlGestureLabels[] = {"swipe", "shake", "circle", "wave", "idle"};
+constexpr int kMlLabelCount = sizeof(kMlGestureLabels) / sizeof(kMlGestureLabels[0]);
 
-// ───────────── CALIBRATION STATE ─────────────
-float gyroBiasX = 0.0f;
-float gyroBiasY = 0.0f;
-
-// ───────────── FILTER STATE ─────────────
-float filteredDpsX = 0.0f;
-float filteredDpsY = 0.0f;
-
-// ───────────── HELPERS ─────────────
-float applyDeadband(float value, float deadband)
+// ── User config (runtime, overwritten by GUI via Serial) ─────────────────────
+struct Config
 {
-  if (fabsf(value) < deadband)
-  {
-    return 0.0f;
-  }
-  return value;
+  // Axis mapping: which DMP axis drives each function
+  uint8_t cursorXAxis = AXIS_YAW;  // default: yaw -> cursor X
+  uint8_t cursorYAxis = AXIS_ROLL; // default: roll -> cursor Y
+  uint8_t clickAxis = AXIS_PITCH;  // default: pitch -> left/right click
+
+  // Invert flags per function
+  bool invertX = false;
+  bool invertY = false;
+  bool invertClick = false;
+
+  // Deadzones (degrees)
+  float deadzoneX = 1.5f;
+  float deadzoneY = 1.5f;
+  float deadzoneClick = 2.0f;
+
+  // Sensitivity
+  float gainX = 0.3f;
+  float gainY = 0.3f;
+
+  // Click threshold
+  float clickThreshDeg = 30.0f;
+
+  // Gesture thresholds
+  float flickVelThresh = 120.0f;
+  float flickReturnDeg = 8.0f;
+  uint16_t flickConfirmMs = 300;
+  float shakeVelThresh = 60.0f;
+  float doubleTiltDeg = 25.0f;
+  float circleMinSpeed = 20.0f;
+
+  // Gesture enable switches
+  bool enableFlick = true;
+  bool enableShake = true;
+  bool enableDoubleTilt = true;
+  bool enableCircle = true;
+} cfg;
+
+Preferences prefs;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+inline int8_t signOf(float v)
+{
+  return (v > 0.f) ? 1 : (v < 0.f) ? -1
+                                   : 0;
 }
 
-void calibrateGyro()
+inline float applyDeadband(float v, float db)
 {
-  float sumX = 0.0f;
-  float sumY = 0.0f;
-
-  Serial.println("Calibrating gyro. Keep MPU6050 still...");
-  for (uint16_t i = 0; i < CALIBRATION_SAMPLES; ++i)
-  {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-    sumX += g.gyro.x;
-    sumY += g.gyro.y;
-    delay(4);
-  }
-
-  gyroBiasX = sumX / CALIBRATION_SAMPLES;
-  gyroBiasY = sumY / CALIBRATION_SAMPLES;
-  Serial.println("Gyro calibration complete.");
+  return fabsf(v) < db ? 0.f : v;
 }
 
-// ───────────── GESTURE CLASSIFICATION ─────────────
-enum GestureType
-{
-  GESTURE_NONE,
-  GESTURE_SWIPE_LEFT,
-  GESTURE_SWIPE_RIGHT,
-  GESTURE_SWIPE_UP,
-  GESTURE_SWIPE_DOWN,
-  GESTURE_SHAKE_X,   // Rapid left-right shake
-  GESTURE_SHAKE_Y,   // Rapid up-down shake
-  GESTURE_DIAG_UR,   // Diagonal swipe upper-right
-  GESTURE_DIAG_UL,   // Diagonal swipe upper-left
-  GESTURE_DIAG_DR,   // Diagonal swipe down-right
-  GESTURE_DIAG_DL,   // Diagonal swipe down-left
-  GESTURE_TAP        // Button pressed with no significant movement
-};
+// Raw DMP angles array indexed by AXIS_* constants
+float axes[3] = {}; // [yaw, pitch, roll] in degrees, updated each frame
 
-// Count how many times the sign of movement reverses on a given axis
-uint8_t countReversals(bool useX)
-{
-  uint8_t reversals = 0;
-  float segAccum = 0.0f;
-  int8_t lastDir = 0; // -1 or +1
+inline float getAxis(uint8_t idx) { return axes[idx]; }
 
-  for (uint16_t i = 0; i < gestureLen; i++)
+// Persistent config helpers (Preferences)
+void saveConfig()
+{
+  prefs.begin("mpu", false);
+  prefs.putBytes("cfg", &cfg, sizeof(cfg));
+  prefs.end();
+}
+
+void loadConfig()
+{
+  prefs.begin("mpu", true);
+  if (prefs.isKey("cfg"))
   {
-    float v = useX ? gestureBuf[i].dpsX : gestureBuf[i].dpsY;
-    segAccum += v;
+    size_t got = prefs.getBytes("cfg", &cfg, sizeof(cfg));
+    (void)got;
+  }
+  prefs.end();
+}
 
-    if (fabsf(segAccum) >= SHAKE_SEG_THRESHOLD)
+// ── Gesture state ─────────────────────────────────────────────────────────────
+struct GestureState
+{
+  uint32_t lastGestureMs = 0;
+
+  float prevAxes[3] = {};
+  uint32_t prevFrameMs = 0;
+
+  struct FlickAxis
+  {
+    uint8_t phase = 0;
+    int8_t direction = 0;
+    float originAngle = 0.f;
+    uint32_t armedMs = 0;
+  } flick[3];
+
+  int8_t shakeSign[3] = {};
+  uint8_t shakeCount[3] = {};
+  uint32_t shakeStartMs = 0;
+
+  uint32_t doubleTiltFirstMs[3][2] = {};
+  bool doubleTiltArmed[3][2] = {};
+
+  uint8_t circleFrames = 0;
+  int8_t circleSignA = 0;
+  int8_t circleSignB = 0;
+} gs;
+
+static const char *AXIS_NAMES[3] = {"YAW", "PITCH", "ROLL"};
+static const char *AXIS_POS[3] = {"YAW+", "PITCH+", "ROLL+"};
+static const char *AXIS_NEG[3] = {"YAW-", "PITCH-", "ROLL-"};
+
+void detectGestures(uint32_t nowMs)
+{
+  if (gs.prevFrameMs == 0)
+  {
+    for (int i = 0; i < 3; i++)
+      gs.prevAxes[i] = axes[i];
+    gs.prevFrameMs = nowMs;
+    return;
+  }
+
+  const float dt = (nowMs - gs.prevFrameMs) * 0.001f;
+  if (dt <= 0.f)
+    return;
+
+  float vel[3];
+  for (int i = 0; i < 3; i++)
+  {
+    vel[i] = (axes[i] - gs.prevAxes[i]) / dt;
+    gs.prevAxes[i] = axes[i];
+  }
+  gs.prevFrameMs = nowMs;
+
+  const bool onCooldown = (nowMs - gs.lastGestureMs) < GESTURE_COOLDOWN_MS;
+
+  // Flick
+  if (cfg.enableFlick)
+  {
+    for (int i = 0; i < 3; i++)
     {
-      int8_t dir = (segAccum > 0) ? 1 : -1;
-      if (lastDir != 0 && dir != lastDir)
+      auto &fa = gs.flick[i];
+      if (fa.phase == 0)
       {
-        reversals++;
+        if (fabsf(vel[i]) > cfg.flickVelThresh)
+        {
+          fa.phase = 1;
+          fa.direction = signOf(vel[i]);
+          fa.originAngle = axes[i];
+          fa.armedMs = nowMs;
+        }
       }
-      lastDir = dir;
-      segAccum = 0.0f;
+      else
+      {
+        if (nowMs - fa.armedMs > cfg.flickConfirmMs)
+        {
+          fa.phase = 0;
+        }
+        else if (fabsf(axes[i] - fa.originAngle) < cfg.flickReturnDeg)
+        {
+          if (!onCooldown)
+          {
+            Serial.print("{\"gesture\":\"Flick\",\"axis\":\"");
+            Serial.print(fa.direction > 0 ? AXIS_POS[i] : AXIS_NEG[i]);
+            Serial.println("\"}");
+            gs.lastGestureMs = nowMs;
+          }
+          fa.phase = 0;
+        }
+      }
     }
-  }
-  return reversals;
-}
-
-GestureType classifyGesture()
-{
-  if (gestureLen == 0)
-  {
-    return GESTURE_TAP;
-  }
-
-  // --- Compute aggregate sums ---
-  float sumX = 0.0f;
-  float sumY = 0.0f;
-  for (uint16_t i = 0; i < gestureLen; i++)
-  {
-    sumX += gestureBuf[i].dpsX;
-    sumY += gestureBuf[i].dpsY;
-  }
-
-  float absX = fabsf(sumX);
-  float absY = fabsf(sumY);
-
-  // --- Check for shakes first (override swipes) ---
-  uint8_t revX = countReversals(true);
-  uint8_t revY = countReversals(false);
-
-  if (revX >= SHAKE_REVERSAL_MIN)
-  {
-    return GESTURE_SHAKE_X;
-  }
-  if (revY >= SHAKE_REVERSAL_MIN)
-  {
-    return GESTURE_SHAKE_Y;
-  }
-
-  // --- Not enough movement at all → tap ---
-  if (absX < GESTURE_SWIPE_THRESHOLD && absY < GESTURE_SWIPE_THRESHOLD)
-  {
-    return GESTURE_TAP;
-  }
-
-  // --- Diagonal detection: both axes significant and ratio is close ---
-  bool xSignificant = absX >= GESTURE_SWIPE_THRESHOLD;
-  bool ySignificant = absY >= GESTURE_SWIPE_THRESHOLD;
-  float ratio = (absX > absY) ? (absX / max(absY, 1.0f)) : (absY / max(absX, 1.0f));
-
-  if (xSignificant && ySignificant && ratio < GESTURE_AXIS_RATIO)
-  {
-    // Diagonal
-    if (sumX > 0 && sumY < 0)
-      return GESTURE_DIAG_UR; // Right + Up (negative Y = up in our mapping)
-    if (sumX < 0 && sumY < 0)
-      return GESTURE_DIAG_UL;
-    if (sumX > 0 && sumY > 0)
-      return GESTURE_DIAG_DR;
-    return GESTURE_DIAG_DL;
-  }
-
-  // --- Cardinal swipe ---
-  if (absX > absY)
-  {
-    return (sumX > 0) ? GESTURE_SWIPE_RIGHT : GESTURE_SWIPE_LEFT;
   }
   else
   {
-    // Note: positive filteredDpsY with negation in moveY means positive sumY = down
-    return (sumY > 0) ? GESTURE_SWIPE_DOWN : GESTURE_SWIPE_UP;
+    for (int i = 0; i < 3; i++)
+    {
+      gs.flick[i].phase = 0;
+      gs.flick[i].direction = 0;
+      gs.flick[i].originAngle = 0.f;
+      gs.flick[i].armedMs = 0;
+    }
   }
-}
 
-// ───────────── EXECUTE GESTURE ACTION ─────────────
-void executeGesture(GestureType gesture)
-{
-  switch (gesture)
+  // Shake
+  if (cfg.enableShake)
   {
-  case GESTURE_SWIPE_RIGHT:
-    Serial.println(">> SWIPE RIGHT → Browser Forward");
-    bleMouse.click(MOUSE_FORWARD);
-    break;
-
-  case GESTURE_SWIPE_LEFT:
-    Serial.println(">> SWIPE LEFT → Browser Back");
-    bleMouse.click(MOUSE_BACK);
-    break;
-
-  case GESTURE_SWIPE_UP:
-    Serial.println(">> SWIPE UP → Scroll Up (fast)");
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < 2; i++)
     {
-      bleMouse.move(0, 0, 1);
-      delay(15);
+      const int8_t s = signOf(vel[i]);
+      if (s == 0 || fabsf(vel[i]) < cfg.shakeVelThresh)
+        continue;
+      if (s != gs.shakeSign[i] && gs.shakeSign[i] != 0)
+      {
+        if (gs.shakeCount[i] == 0)
+          gs.shakeStartMs = nowMs;
+        if (nowMs - gs.shakeStartMs < SHAKE_WINDOW_MS)
+        {
+          gs.shakeCount[i]++;
+          if (gs.shakeCount[i] >= SHAKE_REVERSALS_REQUIRED && !onCooldown)
+          {
+            Serial.print("{\"gesture\":\"Shake\",\"axis\":\"");
+            Serial.print(AXIS_NAMES[i]);
+            Serial.println("\"}");
+            gs.lastGestureMs = nowMs;
+            gs.shakeCount[i] = 0;
+          }
+        }
+        else
+        {
+          gs.shakeCount[i] = 1;
+          gs.shakeStartMs = nowMs;
+        }
+      }
+      gs.shakeSign[i] = s;
     }
-    break;
-
-  case GESTURE_SWIPE_DOWN:
-    Serial.println(">> SWIPE DOWN → Scroll Down (fast)");
-    for (int i = 0; i < 5; i++)
+  }
+  else
+  {
+    for (int i = 0; i < 3; i++)
     {
-      bleMouse.move(0, 0, -1);
-      delay(15);
+      gs.shakeSign[i] = 0;
+      gs.shakeCount[i] = 0;
     }
-    break;
+    gs.shakeStartMs = 0;
+  }
 
-  case GESTURE_SHAKE_X:
-    Serial.println(">> SHAKE X → Horizontal Scroll Left");
-    for (int i = 0; i < 5; i++)
+  // Double-tilt
+  if (cfg.enableDoubleTilt)
+  {
+    for (int i = 0; i < 3; i++)
     {
-      bleMouse.move(0, 0, 0, 1); // horizontal scroll left
-      delay(15);
+      for (int d = 0; d < 2; d++)
+      {
+        const float thresh = (d == 0) ? -cfg.doubleTiltDeg : cfg.doubleTiltDeg;
+        const bool over = (d == 0) ? (axes[i] < thresh) : (axes[i] > thresh);
+        if (over)
+        {
+          if (!gs.doubleTiltArmed[i][d])
+            continue;
+          if (gs.doubleTiltFirstMs[i][d] == 0)
+          {
+            gs.doubleTiltFirstMs[i][d] = nowMs;
+          }
+          else if ((nowMs - gs.doubleTiltFirstMs[i][d]) < DOUBLE_TILT_WINDOW_MS)
+          {
+            if (!onCooldown)
+            {
+              Serial.print("{\"gesture\":\"DoubleTilt\",\"axis\":\"");
+              Serial.print(d == 0 ? AXIS_NEG[i] : AXIS_POS[i]);
+              Serial.println("\"}");
+              gs.lastGestureMs = nowMs;
+            }
+            gs.doubleTiltFirstMs[i][d] = 0;
+          }
+          else
+          {
+            gs.doubleTiltFirstMs[i][d] = nowMs;
+          }
+          gs.doubleTiltArmed[i][d] = false;
+        }
+        else
+        {
+          gs.doubleTiltArmed[i][d] = true;
+          if (fabsf(axes[i]) < cfg.doubleTiltDeg * 0.5f &&
+              gs.doubleTiltFirstMs[i][d] != 0 &&
+              (nowMs - gs.doubleTiltFirstMs[i][d]) >= DOUBLE_TILT_WINDOW_MS)
+          {
+            gs.doubleTiltFirstMs[i][d] = 0;
+          }
+        }
+      }
     }
-    break;
-
-  case GESTURE_SHAKE_Y:
-    Serial.println(">> SHAKE Y → Horizontal Scroll Right");
-    for (int i = 0; i < 5; i++)
+  }
+  else
+  {
+    for (int i = 0; i < 3; i++)
     {
-      bleMouse.move(0, 0, 0, -1); // horizontal scroll right
-      delay(15);
+      for (int d = 0; d < 2; d++)
+      {
+        gs.doubleTiltFirstMs[i][d] = 0;
+        gs.doubleTiltArmed[i][d] = false;
+      }
     }
-    break;
+  }
 
-  case GESTURE_DIAG_UR:
-    Serial.println(">> DIAGONAL UP-RIGHT → Double Click");
-    bleMouse.click(MOUSE_LEFT);
-    delay(60);
-    bleMouse.click(MOUSE_LEFT);
-    break;
-
-  case GESTURE_DIAG_UL:
-    Serial.println(">> DIAGONAL UP-LEFT → Middle Click (open in new tab)");
-    bleMouse.click(MOUSE_MIDDLE);
-    break;
-
-  case GESTURE_DIAG_DR:
-    Serial.println(">> DIAGONAL DOWN-RIGHT → Left+Right Click (context action)");
-    bleMouse.click(MOUSE_LEFT | MOUSE_RIGHT);
-    break;
-
-  case GESTURE_DIAG_DL:
-    Serial.println(">> DIAGONAL DOWN-LEFT → Middle Click");
-    bleMouse.click(MOUSE_MIDDLE);
-    break;
-
-  case GESTURE_TAP:
-    Serial.println(">> TAP (no movement) → Middle Click");
-    bleMouse.click(MOUSE_MIDDLE);
-    break;
-
-  case GESTURE_NONE:
-  default:
-    Serial.println(">> No gesture detected");
-    break;
+  // Circle
+  if (cfg.enableCircle)
+  {
+    const uint8_t a = cfg.cursorXAxis;
+    const uint8_t b = cfg.cursorYAxis;
+    if (fabsf(vel[a]) > cfg.circleMinSpeed && fabsf(vel[b]) > cfg.circleMinSpeed)
+    {
+      const int8_t sa = signOf(vel[a]);
+      const int8_t sb = signOf(vel[b]);
+      if (sa != gs.circleSignA || sb != gs.circleSignB)
+        gs.circleFrames++;
+      gs.circleSignA = sa;
+      gs.circleSignB = sb;
+      if (gs.circleFrames >= CIRCLE_FRAMES_REQUIRED && !onCooldown)
+      {
+        Serial.println("{\"gesture\":\"Circle\"}");
+        gs.lastGestureMs = nowMs;
+        gs.circleFrames = 0;
+      }
+    }
+    else
+    {
+      gs.circleFrames = 0;
+    }
+  }
+  else
+  {
+    gs.circleFrames = 0;
+    gs.circleSignA = 0;
+    gs.circleSignB = 0;
   }
 }
 
-// ───────────── SETUP ─────────────
-void setup(void)
+// ── Serial config parser ─────────────────────────────────────────────────────
+void handleSerial()
 {
+  if (!Serial.available())
+    return;
+
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0)
+    return;
+
+  if (line == "{\"ping\":1}")
+  {
+    Serial.println("{\"pong\":1}");
+    return;
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, line) != DeserializationError::Ok)
+    return;
+  // Support explicit save command: {"save":1}
+  if (doc["save"].is<int>() && doc["save"].as<int>() == 1)
+  {
+    saveConfig();
+    Serial.println("{\"ack\":\"saved\"}");
+    return;
+  }
+  if (!doc["cfg"].is<JsonObject>())
+    return;
+
+  JsonObject c = doc["cfg"].as<JsonObject>();
+  if (c["cursorXAxis"].is<uint8_t>())
+    cfg.cursorXAxis = c["cursorXAxis"].as<uint8_t>();
+  if (c["cursorYAxis"].is<uint8_t>())
+    cfg.cursorYAxis = c["cursorYAxis"].as<uint8_t>();
+  if (c["clickAxis"].is<uint8_t>())
+    cfg.clickAxis = c["clickAxis"].as<uint8_t>();
+  if (c["invertX"].is<bool>())
+    cfg.invertX = c["invertX"].as<bool>();
+  if (c["invertY"].is<bool>())
+    cfg.invertY = c["invertY"].as<bool>();
+  if (c["invertClick"].is<bool>())
+    cfg.invertClick = c["invertClick"].as<bool>();
+  if (c["deadzoneX"].is<float>())
+    cfg.deadzoneX = c["deadzoneX"].as<float>();
+  if (c["deadzoneY"].is<float>())
+    cfg.deadzoneY = c["deadzoneY"].as<float>();
+  if (c["deadzoneClick"].is<float>())
+    cfg.deadzoneClick = c["deadzoneClick"].as<float>();
+  if (c["gainX"].is<float>())
+    cfg.gainX = c["gainX"].as<float>();
+  if (c["gainY"].is<float>())
+    cfg.gainY = c["gainY"].as<float>();
+  if (c["clickThreshDeg"].is<float>())
+    cfg.clickThreshDeg = c["clickThreshDeg"].as<float>();
+  if (c["flickVelThresh"].is<float>())
+    cfg.flickVelThresh = c["flickVelThresh"].as<float>();
+  if (c["flickReturnDeg"].is<float>())
+    cfg.flickReturnDeg = c["flickReturnDeg"].as<float>();
+  if (c["flickConfirmMs"].is<uint16_t>())
+    cfg.flickConfirmMs = c["flickConfirmMs"].as<uint16_t>();
+  if (c["shakeVelThresh"].is<float>())
+    cfg.shakeVelThresh = c["shakeVelThresh"].as<float>();
+  if (c["doubleTiltDeg"].is<float>())
+    cfg.doubleTiltDeg = c["doubleTiltDeg"].as<float>();
+  if (c["circleMinSpeed"].is<float>())
+    cfg.circleMinSpeed = c["circleMinSpeed"].as<float>();
+  if (c["enableFlick"].is<bool>())
+    cfg.enableFlick = c["enableFlick"].as<bool>();
+  if (c["enableShake"].is<bool>())
+    cfg.enableShake = c["enableShake"].as<bool>();
+  if (c["enableDoubleTilt"].is<bool>())
+    cfg.enableDoubleTilt = c["enableDoubleTilt"].as<bool>();
+  if (c["enableCircle"].is<bool>())
+    cfg.enableCircle = c["enableCircle"].as<bool>();
+
+  // Auto-save after applying new config so changes persist immediately
+  saveConfig();
+  Serial.println("{\"ack\":\"cfg\"}");
+}
+
+// ── MPU/DMP objects ─────────────────────────────────────────────────────────
+MPU6050 mpu;
+BleMouse bleMouse("ESP32 MPU Mouse", "Espressif", 100);
+
+bool dmpReady = false;
+uint8_t devStatus = 0;
+uint8_t fifoBuffer[64] = {0};
+
+Quaternion q;
+VectorFloat gravity;
+VectorInt16 aa;
+VectorInt16 gg;
+float ypr[3] = {0.f, 0.f, 0.f};
+
+namespace ml_gestures
+{
+  float featureBuffer[kWindowSize][kFeatureCount] = {};
+  int ringWriteIndex = 0;
+  int bufferedSamples = 0;
+  uint16_t samplesSinceInference = 0;
+
+#if HAS_TFLM
+  // ── TensorFlow Lite Micro state ─────────────────────────────────────────────
+  constexpr size_t kTensorArenaSize = 120 * 1024;
+  alignas(16) static uint8_t tensorArena[kTensorArenaSize];
+
+  tflite::MicroErrorReporter microErrorReporter;
+  const tflite::Model *model = nullptr;
+  tflite::MicroInterpreter *interpreter = nullptr;
+  TfLiteTensor *inputTensor = nullptr;
+  TfLiteTensor *outputTensor = nullptr;
+
+  bool tflmReady = false;
+  bool tflmWarned = false;
+
+  inline float normalizeFeature(int idx, float value)
+  {
+    const float s = kFeatureStd[idx];
+    return (s > 1e-6f) ? ((value - kFeatureMean[idx]) / s) : (value - kFeatureMean[idx]);
+  }
+
+  bool setupTFLM()
+  {
+    model = tflite::GetModel(g_gesture_model_data);
+    if (!model)
+    {
+      Serial.println("TFLM model pointer is null.");
+      return false;
+    }
+    if (model->version() != TFLITE_SCHEMA_VERSION)
+    {
+      Serial.println("TFLM model schema version mismatch.");
+      return false;
+    }
+
+    static tflite::MicroMutableOpResolver<18> opResolver;
+    opResolver.AddReshape();
+    opResolver.AddConv2D();
+    opResolver.AddDepthwiseConv2D();
+    opResolver.AddFullyConnected();
+    opResolver.AddSoftmax();
+    opResolver.AddMean();
+    opResolver.AddMul();
+    opResolver.AddAdd();
+    opResolver.AddQuantize();
+    opResolver.AddDequantize();
+    opResolver.AddRelu();
+    opResolver.AddPad();
+    opResolver.AddPack();
+    opResolver.AddStridedSlice();
+    opResolver.AddExpandDims();
+    opResolver.AddSqueeze();
+    opResolver.AddMaxPool2D();
+    opResolver.AddLogistic();
+
+    static tflite::MicroInterpreter staticInterpreter(model, opResolver, tensorArena, kTensorArenaSize, &microErrorReporter);
+    interpreter = &staticInterpreter;
+
+    if (interpreter->AllocateTensors() != kTfLiteOk)
+    {
+      Serial.println("AllocateTensors failed.");
+      return false;
+    }
+
+    inputTensor = interpreter->input(0);
+    outputTensor = interpreter->output(0);
+
+    if (!inputTensor || !outputTensor)
+    {
+      Serial.println("Input/output tensor missing.");
+      return false;
+    }
+
+    Serial.print("TFLM ready. Arena bytes: ");
+    Serial.println(kTensorArenaSize);
+    return true;
+  }
+
+  void fillModelInputFromRing()
+  {
+    const int inputElements = inputTensor->bytes / ((inputTensor->type == kTfLiteFloat32) ? sizeof(float) : sizeof(int8_t));
+    const int expectedElements = kWindowSize * kFeatureCount;
+    if (inputElements != expectedElements)
+    {
+      if (!tflmWarned)
+      {
+        Serial.print("Input shape mismatch. expected=");
+        Serial.print(expectedElements);
+        Serial.print(" got=");
+        Serial.println(inputElements);
+        tflmWarned = true;
+      }
+      return;
+    }
+
+    int flatIdx = 0;
+    const int oldestIndex = (ringWriteIndex + kWindowSize - bufferedSamples) % kWindowSize;
+
+    for (int i = 0; i < kWindowSize; i++)
+    {
+      const int srcIdx = (oldestIndex + i) % kWindowSize;
+      for (int f = 0; f < kFeatureCount; f++)
+      {
+        const float normalized = normalizeFeature(f, featureBuffer[srcIdx][f]);
+        if (inputTensor->type == kTfLiteFloat32)
+        {
+          inputTensor->data.f[flatIdx] = normalized;
+        }
+        else if (inputTensor->type == kTfLiteInt8)
+        {
+          const float invScale = 1.0f / inputTensor->params.scale;
+          int32_t qv = static_cast<int32_t>(roundf(normalized * invScale) + inputTensor->params.zero_point);
+          if (qv > 127)
+            qv = 127;
+          if (qv < -128)
+            qv = -128;
+          inputTensor->data.int8[flatIdx] = static_cast<int8_t>(qv);
+        }
+        flatIdx++;
+      }
+    }
+  }
+
+  void runInferenceAndPrint()
+  {
+    if (!tflmReady)
+      return;
+    if (bufferedSamples < kWindowSize)
+      return;
+
+    fillModelInputFromRing();
+
+    if (interpreter->Invoke() != kTfLiteOk)
+    {
+      Serial.println("Inference failed.");
+      return;
+    }
+
+    const int outCount = outputTensor->dims->data[outputTensor->dims->size - 1];
+    if (outCount <= 0)
+      return;
+
+    int bestIdx = 0;
+    float bestScore = -1.0f;
+    for (int i = 0; i < outCount; i++)
+    {
+      float score = 0.f;
+      if (outputTensor->type == kTfLiteFloat32)
+      {
+        score = outputTensor->data.f[i];
+      }
+      else if (outputTensor->type == kTfLiteInt8)
+      {
+        score = (static_cast<int32_t>(outputTensor->data.int8[i]) - outputTensor->params.zero_point) * outputTensor->params.scale;
+      }
+      else if (outputTensor->type == kTfLiteUInt8)
+      {
+        score = (static_cast<int32_t>(outputTensor->data.uint8[i]) - outputTensor->params.zero_point) * outputTensor->params.scale;
+      }
+
+      if (score > bestScore)
+      {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+
+    Serial.print("ml_gestures,");
+    if (bestIdx >= 0 && bestIdx < kMlLabelCount)
+    {
+      Serial.print(kMlGestureLabels[bestIdx]);
+    }
+    else
+    {
+      Serial.print("class_");
+      Serial.print(bestIdx);
+    }
+    Serial.print(",");
+    Serial.println(bestScore, 4);
+  }
+#endif
+
+  void pushFeatureSample(const float sample[kFeatureCount])
+  {
+    for (int i = 0; i < kFeatureCount; i++)
+      featureBuffer[ringWriteIndex][i] = sample[i];
+
+    ringWriteIndex = (ringWriteIndex + 1) % kWindowSize;
+    if (bufferedSamples < kWindowSize)
+      bufferedSamples++;
+    samplesSinceInference++;
+  }
+
+  void setup()
+  {
+#if HAS_TFLM
+    tflmReady = setupTFLM();
+#else
+    Serial.println("ml_gestures: TensorFlow Lite Micro headers not found. Disabled.");
+#endif
+  }
+
+  void onSample(const float sample[kFeatureCount])
+  {
+    pushFeatureSample(sample);
+#if HAS_TFLM
+    if (samplesSinceInference >= INFERENCE_STRIDE_SAMPLES)
+    {
+      runInferenceAndPrint();
+      samplesSinceInference = 0;
+    }
+#endif
+  }
+} // namespace ml_gestures
+
+volatile bool mpuInterrupt = false;
+void IRAM_ATTR dmpDataReady() { mpuInterrupt = true; }
+
+void setup()
+{
+  Wire.begin();
+  Wire.setClock(400000);
   Serial.begin(115200);
-  delay(200);
+  while (!Serial)
+    ;
 
-  // GPIO34 is input-only and needs an external pull-up or pull-down resistor.
-  pinMode(PIN_BTN_LEFT, INPUT);
-  pinMode(PIN_BTN_RIGHT, INPUT_PULLUP);
-  pinMode(PIN_BTN_GESTURE, INPUT_PULLUP);
+  // Load persisted config (if any)
+  loadConfig();
 
-  Serial.println("ESP32 MPU BLE Mouse + Gestures starting...");
+  pinMode(INTERRUPT_PIN, INPUT);
 
-  if (!mpu.begin())
+  Serial.println("Initializing MPU6050...");
+  mpu.initialize();
+  if (!mpu.testConnection())
   {
-    Serial.println("Failed to find MPU6050 chip");
+    Serial.println("MPU6050 connection failed.");
     while (true)
-    {
-      delay(10);
-    }
+      ;
   }
 
-  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  devStatus = mpu.dmpInitialize();
+  mpu.setXGyroOffset(0);
+  mpu.setYGyroOffset(0);
+  mpu.setZGyroOffset(0);
+  mpu.setXAccelOffset(0);
+  mpu.setYAccelOffset(0);
+  mpu.setZAccelOffset(0);
 
-  calibrateGyro();
+  if (devStatus == 0)
+  {
+    Serial.println("Calibrating MPU6050... keep sensor still");
+    mpu.CalibrateAccel(6);
+    mpu.CalibrateGyro(6);
+    mpu.setDMPEnabled(true);
+    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
+    dmpReady = true;
+    Serial.println("DMP ready.");
+  }
+  else
+  {
+    Serial.print("DMP init failed code=");
+    Serial.println(devStatus);
+    while (true)
+      ;
+  }
 
   bleMouse.begin();
-  Serial.println("Pair to device: ESP32 MPU Mouse");
-  Serial.println("Gesture button (GPIO39): hold + move to gesture, tap for middle-click");
-  Serial.println("Gestures: Swipe L/R/U/D, Shake X/Y, Diagonals, Tap");
+  Serial.println("BLE advertising as: ESP32 MPU Mouse");
+  ml_gestures::setup();
+
+  Serial.println("Output format:");
+  Serial.println("  RAW: ax,ay,az,gx,gy,gz,yaw,pitch,roll");
+  Serial.println("  PRED: ml_gestures,<label>,<score>");
 }
 
 // ───────────── MAIN LOOP ─────────────
 void loop()
 {
-  // --- Timing & state ---
-  static uint32_t lastSampleMs = 0;
+  if (!dmpReady)
+    return;
+
+  handleSerial();
+
   static uint32_t lastStatusMs = 0;
   static uint32_t lastAdvertiseKickMs = 0;
   static uint32_t connectedSinceMs = 0;
   static uint32_t lastReportMs = 0;
   static uint32_t lastLeftClickMs = 0;
   static uint32_t lastRightClickMs = 0;
-
-  static bool leftWasPressed = false;
-  static bool rightWasPressed = false;
-  static bool gestureWasPressed = false;
+  static bool clickLeftArmed = true;
+  static bool clickRightArmed = true;
   static bool wasConnected = false;
-  static bool gestureActive = false; // true while recording a gesture
 
   const uint32_t nowMs = millis();
   const bool connected = bleMouse.isConnected();
@@ -343,28 +803,13 @@ void loop()
     lastReportMs = nowMs;
     Serial.println("BLE connected.");
   }
-
   if (!connected && wasConnected)
   {
     BLEDevice::startAdvertising();
-    filteredDpsX = 0.0f;
-    filteredDpsY = 0.0f;
-    connectedSinceMs = 0;
-    lastReportMs = 0;
     lastAdvertiseKickMs = nowMs;
-    gestureActive = false;
-    gestureLen = 0;
-    Serial.println("BLE disconnected. Re-advertising for any host...");
+    Serial.println("BLE disconnected. Re-advertising...");
   }
-
   wasConnected = connected;
-
-  // --- 10 ms sample gate ---
-  if (nowMs - lastSampleMs < 10)
-  {
-    return;
-  }
-  lastSampleMs = nowMs;
 
   // --- Not connected: keep advertising ---
   if (!connected)
@@ -374,130 +819,106 @@ void loop()
       BLEDevice::startAdvertising();
       lastAdvertiseKickMs = nowMs;
     }
-
-    if (nowMs - lastStatusMs > 1000)
+    if (nowMs - lastStatusMs > 2000)
     {
-      Serial.println("Waiting for BLE mouse connection...");
+      Serial.println("Waiting for BLE...");
       lastStatusMs = nowMs;
     }
+  }
+
+  const bool mouseReportsEnabled = connected && ((nowMs - connectedSinceMs) >= BLE_POST_CONNECT_DELAY_MS);
+
+  static uint32_t lastSampleMs = 0;
+  if ((nowMs - lastSampleMs) < SERIAL_STREAM_INTERVAL_MS)
     return;
-  }
 
-  // --- Post-connect grace period ---
-  if ((nowMs - connectedSinceMs) < BLE_POST_CONNECT_DELAY_MS)
-  {
-    if (nowMs - lastStatusMs > 1000)
-    {
-      Serial.println("BLE link up. Waiting for HID notifications to be ready...");
-      lastStatusMs = nowMs;
-    }
+  if (!mpu.dmpGetCurrentFIFOPacket(fifoBuffer))
     return;
-  }
 
-  // --- Read buttons ---
-  const bool leftPressed = (digitalRead(PIN_BTN_LEFT) == LOW);
-  const bool rightPressed = (digitalRead(PIN_BTN_RIGHT) == LOW);
-  const bool gesturePressed = (digitalRead(PIN_BTN_GESTURE) == LOW);
+  lastSampleMs = nowMs;
 
-  // --- Left click (debounced) ---
-  if (leftPressed && !leftWasPressed && (nowMs - lastLeftClickMs >= BUTTON_DEBOUNCE_MS))
+  mpu.dmpGetQuaternion(&q, fifoBuffer);
+  mpu.dmpGetAccel(&aa, fifoBuffer);
+  mpu.dmpGetGyro(&gg, fifoBuffer);
+  mpu.dmpGetGravity(&gravity, &q);
+  mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+  const float yaw = ypr[0] * RAD_TO_DEG;
+  const float pitch = ypr[1] * RAD_TO_DEG;
+  const float roll = ypr[2] * RAD_TO_DEG;
+
+  axes[AXIS_YAW] = yaw;
+  axes[AXIS_PITCH] = pitch;
+  axes[AXIS_ROLL] = roll;
+
+  float sample[kFeatureCount] = {
+      static_cast<float>(aa.x),
+      static_cast<float>(aa.y),
+      static_cast<float>(aa.z),
+      static_cast<float>(gg.x),
+      static_cast<float>(gg.y),
+      static_cast<float>(gg.z),
+      yaw,
+      pitch,
+      roll,
+  };
+
+  // Stream raw features for recording/debugging.
+  Serial.print(sample[0], 3);
+  for (int i = 1; i < kFeatureCount; i++)
   {
-    bleMouse.click(MOUSE_LEFT);
-    lastLeftClickMs = nowMs;
+    Serial.print(',');
+    Serial.print(sample[i], 3);
   }
+  Serial.println();
 
-  // --- Right click (debounced) ---
-  if (rightPressed && !rightWasPressed && (nowMs - lastRightClickMs >= BUTTON_DEBOUNCE_MS))
+  ml_gestures::onSample(sample);
+
+  // Keep original cursor/click/manual-gesture pipeline intact.
+  const float rawX = applyDeadband(getAxis(cfg.cursorXAxis), cfg.deadzoneX);
+  const float rawY = applyDeadband(getAxis(cfg.cursorYAxis), cfg.deadzoneY);
+  const float rawClick = applyDeadband(getAxis(cfg.clickAxis), cfg.deadzoneClick);
+
+  const float cursorX = rawX * cfg.gainX * (cfg.invertX ? -1.f : 1.f);
+  const float cursorY = rawY * cfg.gainY * (cfg.invertY ? -1.f : 1.f);
+  const float clickV = rawClick * (cfg.invertClick ? -1.f : 1.f);
+
+  detectGestures(nowMs);
+
+  if (mouseReportsEnabled && clickV < -cfg.clickThreshDeg)
   {
-    bleMouse.click(MOUSE_RIGHT);
-    lastRightClickMs = nowMs;
-  }
-
-  // --- Read gyro ---
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-
-  float gyroXDps = (g.gyro.y - gyroBiasY) * RAD_TO_DEG_F;
-  float gyroYDps = (g.gyro.x - gyroBiasX) * RAD_TO_DEG_F;
-
-  gyroXDps = applyDeadband(gyroXDps, GYRO_DEADBAND_DPS);
-  gyroYDps = applyDeadband(gyroYDps, GYRO_DEADBAND_DPS);
-
-  // ─── GESTURE MODE ───
-  if (gesturePressed)
-  {
-    // Just started holding → begin recording
-    if (!gestureActive)
+    if (clickLeftArmed && (nowMs - lastLeftClickMs >= CLICK_REARM_MS))
     {
-      gestureActive = true;
-      gestureLen = 0;
-      // Reset the smoothing filter so cursor doesn't jump on release
-      filteredDpsX = 0.0f;
-      filteredDpsY = 0.0f;
+      bleMouse.click(MOUSE_LEFT);
+      lastLeftClickMs = nowMs;
+      clickLeftArmed = false;
     }
-
-    // Record raw DPS sample into gesture buffer
-    if (gestureLen < GESTURE_MAX_SAMPLES)
-    {
-      gestureBuf[gestureLen].dpsX = gyroXDps;
-      gestureBuf[gestureLen].dpsY = gyroYDps;
-      gestureLen++;
-    }
-    // Do NOT move the cursor while gesture is active
-  }
-  else if (gestureActive)
-  {
-    // Gesture button just released → classify and execute
-    gestureActive = false;
-
-    Serial.print("Gesture recorded: ");
-    Serial.print(gestureLen);
-    Serial.println(" samples");
-
-    GestureType result = classifyGesture();
-    executeGesture(result);
-
-    gestureLen = 0;
   }
   else
   {
-    // ─── NORMAL MOUSE MODE ───
-    filteredDpsX = (1.0f - SMOOTHING_ALPHA) * filteredDpsX + SMOOTHING_ALPHA * gyroXDps;
-    filteredDpsY = (1.0f - SMOOTHING_ALPHA) * filteredDpsY + SMOOTHING_ALPHA * gyroYDps;
-
-    int moveX = static_cast<int>(roundf(filteredDpsX * GYRO_TO_MOUSE_GAIN));
-    int moveY = static_cast<int>(roundf(-filteredDpsY * GYRO_TO_MOUSE_GAIN));
-
-    moveX = constrain(moveX, -127, 127);
-    moveY = constrain(moveY, -127, 127);
-
-    if ((moveX != 0 || moveY != 0) && (nowMs - lastReportMs >= BLE_REPORT_INTERVAL_MS))
-    {
-      bleMouse.move(static_cast<int8_t>(moveX), static_cast<int8_t>(moveY));
-      lastReportMs = nowMs;
-    }
+    clickLeftArmed = true;
   }
 
-  // --- Status print ---
-  if (nowMs - lastStatusMs > 1000)
+  if (mouseReportsEnabled && clickV > cfg.clickThreshDeg)
   {
-    if (gestureActive)
+    if (clickRightArmed && (nowMs - lastRightClickMs >= CLICK_REARM_MS))
     {
-      Serial.print("GESTURE MODE | samples=");
-      Serial.println(gestureLen);
+      bleMouse.click(MOUSE_RIGHT);
+      lastRightClickMs = nowMs;
+      clickRightArmed = false;
     }
-    else
-    {
-      Serial.print("Connected | dpsX=");
-      Serial.print(filteredDpsX, 2);
-      Serial.print(" dpsY=");
-      Serial.println(filteredDpsY, 2);
-    }
-    lastStatusMs = nowMs;
+  }
+  else
+  {
+    clickRightArmed = true;
   }
 
-  // --- Update previous-frame button states (must be LAST) ---
-  leftWasPressed = leftPressed;
-  rightWasPressed = rightPressed;
-  gestureWasPressed = gesturePressed;
+  const int moveX = constrain(static_cast<int>(roundf(cursorX)), -127, 127);
+  const int moveY = constrain(static_cast<int>(roundf(-cursorY)), -127, 127);
+
+  if (mouseReportsEnabled && (moveX != 0 || moveY != 0) && (nowMs - lastReportMs >= BLE_REPORT_INTERVAL_MS))
+  {
+    bleMouse.move(static_cast<int8_t>(moveX), static_cast<int8_t>(moveY));
+    lastReportMs = nowMs;
+  }
 }
