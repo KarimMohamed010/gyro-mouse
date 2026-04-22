@@ -1170,6 +1170,10 @@ class MainController(QObject):
         self._drag_phase = DragPhase.IDLE
         self._mouse      = MouseController() if PYNPUT_AVAILABLE else None
         self._armed_t    = None
+        self._user32     = ctypes.windll.user32 if sys.platform == "win32" else None
+        self._last_hwnd  = None
+        self._last_hover_pos = None
+        self._overlay_hwnds = set()
 
         self._dwell = DwellTracker(DWELL_CLICK)
         self._dwell.progress.connect(self._on_prog)
@@ -1197,6 +1201,14 @@ class MainController(QObject):
 
         self._right.show()
         self._left.show()
+        if self._user32:
+            for widget in (self._right, self._left, self._ring):
+                try:
+                    hwnd = int(widget.winId())
+                    if hwnd:
+                        self._overlay_hwnds.add(hwnd)
+                except Exception:
+                    continue
 
         self._last_t = time.monotonic()
         self._timer  = QTimer()
@@ -1261,6 +1273,29 @@ class MainController(QObject):
                 self._dwell.update(x, y)
 
         self._ring.tick(delta)
+
+    def _store_target_window(self, x: int, y: int):
+        if not self._user32:
+            return
+        try:
+            pt = wintypes.POINT()
+            pt.x = int(x)
+            pt.y = int(y)
+            hwnd = self._user32.WindowFromPoint(pt)
+            if not hwnd:
+                return
+
+            ga_root = 2  # GA_ROOT
+            root_hwnd = self._user32.GetAncestor(hwnd, ga_root)
+            if not root_hwnd:
+                root_hwnd = hwnd
+            if root_hwnd in self._overlay_hwnds:
+                return
+
+            self._last_hwnd = root_hwnd
+            self._last_hover_pos = (pt.x, pt.y)
+        except Exception as e:
+            print(f"[DwellClick] target capture error: {e}")
 
     def _set(self, new: State):
         old = self._state; self._state = new
@@ -1401,6 +1436,7 @@ class MainController(QObject):
             self._left.set_kb_open(True)
 
     def _do_click(self, x, y, right):
+        self._store_target_window(x, y)
         kind = "RIGHT" if right else "LEFT"
         if not PYNPUT_AVAILABLE or not self._mouse:
             print(f"[DwellClick] {kind} CLICK ({x:.0f},{y:.0f}) [sim]"); return
@@ -1409,6 +1445,7 @@ class MainController(QObject):
         except Exception as e: print(f"[DwellClick] {e}")
 
     def _do_dbl_click(self, x, y):
+        self._store_target_window(x, y)
         if not PYNPUT_AVAILABLE or not self._mouse:
             print(f"[DwellClick] DBL-CLICK ({x:.0f},{y:.0f}) [sim]"); return
         try:
@@ -1416,6 +1453,8 @@ class MainController(QObject):
         except Exception as e: print(f"[DwellClick] {e}")
 
     def _do_mouse_down(self):
+        x, y = QCursor.pos().x(), QCursor.pos().y()
+        self._store_target_window(x, y)
         if not PYNPUT_AVAILABLE or not self._mouse:
             print("[DwellClick] MOUSE DOWN [sim]"); return
         try: self._mouse.press(Button.left)
@@ -1428,6 +1467,32 @@ class MainController(QObject):
         except Exception as e: print(f"[DwellClick] {e}")
 
     def _do_scroll(self, amount):
+        # Prefer scrolling the last real window hovered by the cursor.
+        if self._user32 and self._last_hwnd:
+            try:
+                wm_mousewheel = 0x020A
+                delta = int(-amount * 120)
+                delta_word = ctypes.c_ushort(delta & 0xFFFF).value
+                w_param = delta_word << 16
+
+                if self._last_hover_pos:
+                    cx, cy = self._last_hover_pos
+                else:
+                    rect = wintypes.RECT()
+                    if not self._user32.GetWindowRect(self._last_hwnd, ctypes.byref(rect)):
+                        raise OSError("GetWindowRect failed")
+                    cx = (rect.left + rect.right) // 2
+                    cy = (rect.top + rect.bottom) // 2
+
+                x_word = ctypes.c_ushort(cx & 0xFFFF).value
+                y_word = ctypes.c_ushort(cy & 0xFFFF).value
+                l_param = (y_word << 16) | x_word
+
+                self._user32.PostMessageW(self._last_hwnd, wm_mousewheel, w_param, l_param)
+                return
+            except Exception as e:
+                print(f"[DwellClick] targeted scroll failed: {e}")
+
         if not PYNPUT_AVAILABLE or not self._mouse:
             print(f"[DwellClick] SCROLL {amount:+d} [sim]"); return
         try: self._mouse.scroll(0, -amount)
