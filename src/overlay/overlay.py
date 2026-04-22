@@ -73,6 +73,8 @@ from PySide6.QtGui     import (
     QRadialGradient, QCursor
 )
 
+from modern_keyboard import KeyboardManager as ModernKeyboardManager
+
 try:
     from pynput.mouse    import Button, Controller as MouseController
     from pynput.keyboard import Controller as KbController, Key
@@ -1182,7 +1184,7 @@ class MainController(QObject):
         self._right  = RightPanel()
         self._left   = LeftPanel()
         self._ring   = CursorRing()
-        self._kb     = KeyboardManager()
+        self._kb     = ModernKeyboardManager()
 
         self._right.arm_left.connect(self._on_arm_left)
         self._right.arm_right.connect(self._on_arm_right)
