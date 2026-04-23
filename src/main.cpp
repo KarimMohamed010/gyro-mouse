@@ -28,7 +28,6 @@ constexpr uint8_t INTERRUPT_PIN = 2;
 // ── Fixed tuning (not user-configurable) ─────────────────────────────────────
 constexpr uint16_t BLE_POST_CONNECT_DELAY_MS = 1200;
 constexpr uint16_t BLE_REPORT_INTERVAL_MS = 16;
-constexpr uint16_t CLICK_REARM_MS = 600;
 constexpr uint16_t GESTURE_COOLDOWN_MS = 800;
 constexpr uint16_t SHAKE_WINDOW_MS = 800;
 constexpr uint16_t DOUBLE_TILT_WINDOW_MS = 500;
@@ -111,8 +110,8 @@ struct Config
   float gainX = 0.3f;
   float gainY = 0.3f;
 
-  // Click threshold
-  float clickThreshDeg = 30.0f;
+  // Tilt threshold placeholder (reserved for future tilt actions)
+  float tiltThreshDeg = 30.0f;
 
   // Gesture thresholds
   float flickVelThresh = 120.0f;
@@ -685,8 +684,10 @@ void handleSerial()
     cfg.gainX = c["gainX"].as<float>();
   if (c["gainY"].is<float>())
     cfg.gainY = c["gainY"].as<float>();
-  if (c["clickThreshDeg"].is<float>())
-    cfg.clickThreshDeg = c["clickThreshDeg"].as<float>();
+  if (c["tiltThreshDeg"].is<float>())
+    cfg.tiltThreshDeg = c["tiltThreshDeg"].as<float>();
+  else if (c["clickThreshDeg"].is<float>())
+    cfg.tiltThreshDeg = c["clickThreshDeg"].as<float>();
   if (c["flickVelThresh"].is<float>())
     cfg.flickVelThresh = c["flickVelThresh"].as<float>();
   if (c["flickReturnDeg"].is<float>())
@@ -1042,10 +1043,6 @@ void loop()
   static uint32_t lastStatusMs = 0;
   static uint32_t connectedSinceMs = 0;
   static uint32_t lastReportMs = 0;
-  static uint32_t lastLeftClickMs = 0;
-  static uint32_t lastRightClickMs = 0;
-  static bool clickLeftArmed = true;
-  static bool clickRightArmed = true;
   static bool wasConnected = false;
 
   const uint32_t nowMs = millis();
@@ -1120,44 +1117,22 @@ void loop()
 
   ml_gestures::onSample(sample);
 
-  // Keep original cursor/click/manual-gesture pipeline intact.
+  // Keep original cursor/tilt/manual-gesture pipeline intact.
   const float rawX = applyDeadband(getAxis(cfg.cursorXAxis), cfg.deadzoneX);
   const float rawY = applyDeadband(getAxis(cfg.cursorYAxis), cfg.deadzoneY);
-  const float rawClick = applyDeadband(getAxis(cfg.clickAxis), cfg.deadzoneClick);
+  const float rawTilt = applyDeadband(getAxis(cfg.clickAxis), cfg.deadzoneClick);
 
   const float cursorX = rawX * cfg.gainX * (cfg.invertX ? -1.f : 1.f);
   const float cursorY = rawY * cfg.gainY * (cfg.invertY ? -1.f : 1.f);
-  const float clickV = rawClick * (cfg.invertClick ? -1.f : 1.f);
+  const float tiltV = rawTilt * (cfg.invertClick ? -1.f : 1.f);
 
   detectGestures(nowMs, mouseReportsEnabled);
 
-  if (mouseReportsEnabled && clickV < -cfg.clickThreshDeg)
-  {
-    if (clickLeftArmed && (nowMs - lastLeftClickMs >= CLICK_REARM_MS))
-    {
-      bleController.mouseClick(MOUSE_LEFT);
-      lastLeftClickMs = nowMs;
-      clickLeftArmed = false;
-    }
-  }
-  else
-  {
-    clickLeftArmed = true;
-  }
-
-  if (mouseReportsEnabled && clickV > cfg.clickThreshDeg)
-  {
-    if (clickRightArmed && (nowMs - lastRightClickMs >= CLICK_REARM_MS))
-    {
-      bleController.mouseClick(MOUSE_RIGHT);
-      lastRightClickMs = nowMs;
-      clickRightArmed = false;
-    }
-  }
-  else
-  {
-    clickRightArmed = true;
-  }
+  // Placeholder only: keep threshold checks but intentionally do nothing for now.
+  const bool tiltPastNegative = mouseReportsEnabled && (tiltV < -cfg.tiltThreshDeg);
+  const bool tiltPastPositive = mouseReportsEnabled && (tiltV > cfg.tiltThreshDeg);
+  (void)tiltPastNegative;
+  (void)tiltPastPositive;
 
   const int moveX = constrain(static_cast<int>(roundf(cursorX)), -127, 127);
   const int moveY = constrain(static_cast<int>(roundf(-cursorY)), -127, 127);
