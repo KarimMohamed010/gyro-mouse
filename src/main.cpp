@@ -2,11 +2,10 @@
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
 #include <Wire.h>
-#include <BleController.h>
+#include <BleMouse.h>
+#include <BLEDevice.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include <ctype.h>
-#include <string.h>
 
 #include "model_data.h"
 
@@ -44,12 +43,9 @@ constexpr uint16_t INFERENCE_STRIDE_SAMPLES = 10;  // run every 10 new samples
 constexpr uint8_t AXIS_YAW = 0;
 constexpr uint8_t AXIS_PITCH = 1;
 constexpr uint8_t AXIS_ROLL = 2;
-constexpr uint8_t AXIS_COUNT = 3;
 
 constexpr int kFeatureCount = 9; // ax,ay,az,gx,gy,gz,yaw,pitch,roll
 constexpr int kWindowSize = 100;
-constexpr size_t kShortcutMaxLen = 32;
-constexpr uint32_t CONFIG_SCHEMA_VERSION = 2;
 
 #if __has_include("feature_norm.h")
 #include "feature_norm.h"
@@ -89,8 +85,6 @@ constexpr int kMlLabelCount = sizeof(kMlGestureLabels) / sizeof(kMlGestureLabels
 // ── User config (runtime, overwritten by GUI via Serial) ─────────────────────
 struct Config
 {
-  uint32_t schemaVersion = CONFIG_SCHEMA_VERSION;
-
   // Axis mapping: which DMP axis drives each function
   uint8_t cursorXAxis = AXIS_YAW;  // default: yaw -> cursor X
   uint8_t cursorYAxis = AXIS_ROLL; // default: roll -> cursor Y
@@ -126,19 +120,9 @@ struct Config
   bool enableShake = true;
   bool enableDoubleTilt = true;
   bool enableCircle = true;
-
-  // Gesture keymaps, examples: ALT+TAB, CTRL+SHIFT+M, NONE
-  char shortcutFlick[kShortcutMaxLen] = "NONE";
-  char shortcutShake[kShortcutMaxLen] = "ALT+TAB";
-  char shortcutDoubleTilt[kShortcutMaxLen] = "NONE";
-  char shortcutCircle[kShortcutMaxLen] = "NONE";
-};
-
-const Config kDefaultConfig = Config{};
-Config cfg = kDefaultConfig;
+} cfg;
 
 Preferences prefs;
-BleController bleController("ESP32 MPU Controller", "Espressif", 100);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 inline int8_t signOf(float v)
@@ -158,221 +142,8 @@ float axes[3] = {}; // [yaw, pitch, roll] in degrees, updated each frame
 inline float getAxis(uint8_t idx) { return axes[idx]; }
 
 // Persistent config helpers (Preferences)
-void copyShortcut(char *dst, const char *src)
-{
-  if (!dst)
-    return;
-
-  if (!src || src[0] == '\0')
-    src = "NONE";
-
-  strncpy(dst, src, kShortcutMaxLen - 1);
-  dst[kShortcutMaxLen - 1] = '\0';
-}
-
-void sanitizeConfig()
-{
-  if (cfg.cursorXAxis >= AXIS_COUNT)
-    cfg.cursorXAxis = AXIS_YAW;
-  if (cfg.cursorYAxis >= AXIS_COUNT)
-    cfg.cursorYAxis = AXIS_ROLL;
-  if (cfg.clickAxis >= AXIS_COUNT)
-    cfg.clickAxis = AXIS_PITCH;
-
-  cfg.shortcutFlick[kShortcutMaxLen - 1] = '\0';
-  cfg.shortcutShake[kShortcutMaxLen - 1] = '\0';
-  cfg.shortcutDoubleTilt[kShortcutMaxLen - 1] = '\0';
-  cfg.shortcutCircle[kShortcutMaxLen - 1] = '\0';
-
-  if (cfg.shortcutFlick[0] == '\0')
-    copyShortcut(cfg.shortcutFlick, "NONE");
-  if (cfg.shortcutShake[0] == '\0')
-    copyShortcut(cfg.shortcutShake, "ALT+TAB");
-  if (cfg.shortcutDoubleTilt[0] == '\0')
-    copyShortcut(cfg.shortcutDoubleTilt, "NONE");
-  if (cfg.shortcutCircle[0] == '\0')
-    copyShortcut(cfg.shortcutCircle, "NONE");
-}
-
-char *trimToken(char *token)
-{
-  while (*token && isspace(static_cast<unsigned char>(*token)))
-    ++token;
-  if (*token == '\0')
-    return token;
-
-  char *end = token + strlen(token) - 1;
-  while (end > token && isspace(static_cast<unsigned char>(*end)))
-  {
-    *end = '\0';
-    --end;
-  }
-  return token;
-}
-
-uint8_t parseHidKeyToken(const char *token)
-{
-  if (!token || token[0] == '\0')
-    return 0;
-
-  if (strlen(token) == 1)
-  {
-    const char c = token[0];
-    if (c >= 'A' && c <= 'Z')
-      return static_cast<uint8_t>(0x04 + (c - 'A'));
-    if (c >= '1' && c <= '9')
-      return static_cast<uint8_t>(0x1E + (c - '1'));
-    if (c == '0')
-      return 0x27;
-  }
-
-  if (strcmp(token, "TAB") == 0)
-    return 0x2B;
-  if (strcmp(token, "ENTER") == 0 || strcmp(token, "RETURN") == 0)
-    return 0x28;
-  if (strcmp(token, "ESC") == 0 || strcmp(token, "ESCAPE") == 0)
-    return 0x29;
-  if (strcmp(token, "SPACE") == 0)
-    return 0x2C;
-  if (strcmp(token, "BACKSPACE") == 0)
-    return 0x2A;
-  if (strcmp(token, "DELETE") == 0 || strcmp(token, "DEL") == 0)
-    return 0x4C;
-  if (strcmp(token, "INSERT") == 0)
-    return 0x49;
-  if (strcmp(token, "HOME") == 0)
-    return 0x4A;
-  if (strcmp(token, "END") == 0)
-    return 0x4D;
-  if (strcmp(token, "PAGEUP") == 0 || strcmp(token, "PGUP") == 0)
-    return 0x4B;
-  if (strcmp(token, "PAGEDOWN") == 0 || strcmp(token, "PGDN") == 0)
-    return 0x4E;
-  if (strcmp(token, "LEFT") == 0 || strcmp(token, "LEFTARROW") == 0)
-    return 0x50;
-  if (strcmp(token, "RIGHT") == 0 || strcmp(token, "RIGHTARROW") == 0)
-    return 0x4F;
-  if (strcmp(token, "UP") == 0 || strcmp(token, "UPARROW") == 0)
-    return 0x52;
-  if (strcmp(token, "DOWN") == 0 || strcmp(token, "DOWNARROW") == 0)
-    return 0x51;
-
-  if (token[0] == 'F' && token[1] >= '1' && token[1] <= '9' && token[2] == '\0')
-    return static_cast<uint8_t>(0x3A + (token[1] - '1'));
-  if (strcmp(token, "F10") == 0)
-    return 0x43;
-  if (strcmp(token, "F11") == 0)
-    return 0x44;
-  if (strcmp(token, "F12") == 0)
-    return 0x45;
-
-  return 0;
-}
-
-bool parseShortcut(const char *shortcut, uint8_t &modifiers, uint8_t &keycode)
-{
-  modifiers = 0;
-  keycode = 0;
-
-  if (!shortcut || shortcut[0] == '\0')
-    return false;
-
-  char buf[kShortcutMaxLen];
-  copyShortcut(buf, shortcut);
-
-  for (size_t i = 0; buf[i] != '\0'; i++)
-  {
-    if (buf[i] == '-')
-      buf[i] = '+';
-    else
-      buf[i] = static_cast<char>(toupper(static_cast<unsigned char>(buf[i])));
-  }
-
-  char *token = strtok(buf, "+");
-  while (token)
-  {
-    char *t = trimToken(token);
-    if (strcmp(t, "NONE") == 0 || strcmp(t, "OFF") == 0 || strcmp(t, "DISABLED") == 0)
-      return false;
-
-    if (strcmp(t, "CTRL") == 0 || strcmp(t, "CONTROL") == 0)
-      modifiers |= KEY_MOD_LCTRL;
-    else if (strcmp(t, "SHIFT") == 0)
-      modifiers |= KEY_MOD_LSHIFT;
-    else if (strcmp(t, "ALT") == 0)
-      modifiers |= KEY_MOD_LALT;
-    else if (strcmp(t, "WIN") == 0 || strcmp(t, "GUI") == 0 || strcmp(t, "CMD") == 0)
-      modifiers |= KEY_MOD_LMETA;
-    else
-    {
-      const uint8_t parsed = parseHidKeyToken(t);
-      if (parsed == 0 || keycode != 0)
-        return false;
-      keycode = parsed;
-    }
-
-    token = strtok(nullptr, "+");
-  }
-
-  return keycode != 0;
-}
-
-const char *shortcutForGesture(const char *gesture)
-{
-  if (strcmp(gesture, "Flick") == 0)
-    return cfg.shortcutFlick;
-  if (strcmp(gesture, "Shake") == 0)
-    return cfg.shortcutShake;
-  if (strcmp(gesture, "DoubleTilt") == 0)
-    return cfg.shortcutDoubleTilt;
-  if (strcmp(gesture, "Circle") == 0)
-    return cfg.shortcutCircle;
-  return "";
-}
-
-bool fireShortcut(const char *shortcut)
-{
-  uint8_t modifiers = 0;
-  uint8_t keycode = 0;
-  if (!parseShortcut(shortcut, modifiers, keycode))
-    return false;
-
-  bleController.sendRawKeyboard(modifiers, keycode, 0, 0, 0, 0, 0);
-  delay(25);
-  bleController.sendRawKeyboard(0, 0, 0, 0, 0, 0, 0);
-  return true;
-}
-
-void emitGestureEvent(const char *gesture, const char *axis, bool hidReady)
-{
-  const char *shortcut = shortcutForGesture(gesture);
-  const bool hasShortcut = shortcut && shortcut[0] != '\0' && strcmp(shortcut, "NONE") != 0;
-  const bool sent = (hasShortcut && hidReady) ? fireShortcut(shortcut) : false;
-
-  Serial.print("{\"gesture\":\"");
-  Serial.print(gesture);
-  Serial.print("\"");
-  if (axis && axis[0] != '\0')
-  {
-    Serial.print(",\"axis\":\"");
-    Serial.print(axis);
-    Serial.print("\"");
-  }
-  if (hasShortcut)
-  {
-    Serial.print(",\"shortcut\":\"");
-    Serial.print(shortcut);
-    Serial.print("\"");
-    Serial.print(",\"shortcutSent\":");
-    Serial.print(sent ? 1 : 0);
-  }
-  Serial.println("}");
-}
-
 void saveConfig()
 {
-  cfg.schemaVersion = CONFIG_SCHEMA_VERSION;
-  sanitizeConfig();
   prefs.begin("mpu", false);
   prefs.putBytes("cfg", &cfg, sizeof(cfg));
   prefs.end();
@@ -380,23 +151,13 @@ void saveConfig()
 
 void loadConfig()
 {
-  cfg = kDefaultConfig;
   prefs.begin("mpu", true);
   if (prefs.isKey("cfg"))
   {
-    Config loaded = kDefaultConfig;
-    size_t got = prefs.getBytes("cfg", &loaded, sizeof(loaded));
-    if (got == sizeof(loaded) && loaded.schemaVersion == CONFIG_SCHEMA_VERSION)
-    {
-      cfg = loaded;
-    }
-    else
-    {
-      Serial.println("Config schema mismatch. Using defaults.");
-    }
+    size_t got = prefs.getBytes("cfg", &cfg, sizeof(cfg));
+    (void)got;
   }
   prefs.end();
-  sanitizeConfig();
 }
 
 // ── Gesture state ─────────────────────────────────────────────────────────────
@@ -431,7 +192,7 @@ static const char *AXIS_NAMES[3] = {"YAW", "PITCH", "ROLL"};
 static const char *AXIS_POS[3] = {"YAW+", "PITCH+", "ROLL+"};
 static const char *AXIS_NEG[3] = {"YAW-", "PITCH-", "ROLL-"};
 
-void detectGestures(uint32_t nowMs, bool hidReady)
+void detectGestures(uint32_t nowMs)
 {
   if (gs.prevFrameMs == 0)
   {
@@ -481,7 +242,9 @@ void detectGestures(uint32_t nowMs, bool hidReady)
         {
           if (!onCooldown)
           {
-            emitGestureEvent("Flick", fa.direction > 0 ? AXIS_POS[i] : AXIS_NEG[i], hidReady);
+            Serial.print("{\"gesture\":\"Flick\",\"axis\":\"");
+            Serial.print(fa.direction > 0 ? AXIS_POS[i] : AXIS_NEG[i]);
+            Serial.println("\"}");
             gs.lastGestureMs = nowMs;
           }
           fa.phase = 0;
@@ -517,7 +280,9 @@ void detectGestures(uint32_t nowMs, bool hidReady)
           gs.shakeCount[i]++;
           if (gs.shakeCount[i] >= SHAKE_REVERSALS_REQUIRED && !onCooldown)
           {
-            emitGestureEvent("Shake", AXIS_NAMES[i], hidReady);
+            Serial.print("{\"gesture\":\"Shake\",\"axis\":\"");
+            Serial.print(AXIS_NAMES[i]);
+            Serial.println("\"}");
             gs.lastGestureMs = nowMs;
             gs.shakeCount[i] = 0;
           }
@@ -562,7 +327,9 @@ void detectGestures(uint32_t nowMs, bool hidReady)
           {
             if (!onCooldown)
             {
-              emitGestureEvent("DoubleTilt", d == 0 ? AXIS_NEG[i] : AXIS_POS[i], hidReady);
+              Serial.print("{\"gesture\":\"DoubleTilt\",\"axis\":\"");
+              Serial.print(d == 0 ? AXIS_NEG[i] : AXIS_POS[i]);
+              Serial.println("\"}");
               gs.lastGestureMs = nowMs;
             }
             gs.doubleTiltFirstMs[i][d] = 0;
@@ -613,7 +380,7 @@ void detectGestures(uint32_t nowMs, bool hidReady)
       gs.circleSignB = sb;
       if (gs.circleFrames >= CIRCLE_FRAMES_REQUIRED && !onCooldown)
       {
-        emitGestureEvent("Circle", "", hidReady);
+        Serial.println("{\"gesture\":\"Circle\"}");
         gs.lastGestureMs = nowMs;
         gs.circleFrames = 0;
       }
@@ -694,8 +461,6 @@ void handleSerial()
     cfg.flickReturnDeg = c["flickReturnDeg"].as<float>();
   if (c["flickConfirmMs"].is<uint16_t>())
     cfg.flickConfirmMs = c["flickConfirmMs"].as<uint16_t>();
-  else if (c["flickConfirmMs"].is<float>())
-    cfg.flickConfirmMs = static_cast<uint16_t>(c["flickConfirmMs"].as<float>());
   if (c["shakeVelThresh"].is<float>())
     cfg.shakeVelThresh = c["shakeVelThresh"].as<float>();
   if (c["doubleTiltDeg"].is<float>())
@@ -711,36 +476,14 @@ void handleSerial()
   if (c["enableCircle"].is<bool>())
     cfg.enableCircle = c["enableCircle"].as<bool>();
 
-  if (c["shortcutFlick"].is<const char *>())
-    copyShortcut(cfg.shortcutFlick, c["shortcutFlick"].as<const char *>());
-  if (c["shortcutShake"].is<const char *>())
-    copyShortcut(cfg.shortcutShake, c["shortcutShake"].as<const char *>());
-  if (c["shortcutDoubleTilt"].is<const char *>())
-    copyShortcut(cfg.shortcutDoubleTilt, c["shortcutDoubleTilt"].as<const char *>());
-  if (c["shortcutCircle"].is<const char *>())
-    copyShortcut(cfg.shortcutCircle, c["shortcutCircle"].as<const char *>());
-
-  if (c["keymap"].is<JsonObject>())
-  {
-    JsonObject km = c["keymap"].as<JsonObject>();
-    if (km["flick"].is<const char *>())
-      copyShortcut(cfg.shortcutFlick, km["flick"].as<const char *>());
-    if (km["shake"].is<const char *>())
-      copyShortcut(cfg.shortcutShake, km["shake"].as<const char *>());
-    if (km["doubleTilt"].is<const char *>())
-      copyShortcut(cfg.shortcutDoubleTilt, km["doubleTilt"].as<const char *>());
-    if (km["circle"].is<const char *>())
-      copyShortcut(cfg.shortcutCircle, km["circle"].as<const char *>());
-  }
-
   // Auto-save after applying new config so changes persist immediately
-  sanitizeConfig();
   saveConfig();
   Serial.println("{\"ack\":\"cfg\"}");
 }
 
 // ── MPU/DMP objects ─────────────────────────────────────────────────────────
 MPU6050 mpu;
+BleMouse bleMouse("ESP32 MPU Mouse", "Espressif", 100);
 
 bool dmpReady = false;
 uint8_t devStatus = 0;
@@ -1024,8 +767,8 @@ void setup()
       ;
   }
 
-  bleController.begin();
-  Serial.println("BLE advertising as: ESP32 MPU Controller");
+  bleMouse.begin();
+  Serial.println("BLE advertising as: ESP32 MPU Mouse");
   ml_gestures::setup();
 
   Serial.println("Output format:");
@@ -1041,12 +784,13 @@ void loop()
   handleSerial();
 
   static uint32_t lastStatusMs = 0;
+  static uint32_t lastAdvertiseKickMs = 0;
   static uint32_t connectedSinceMs = 0;
   static uint32_t lastReportMs = 0;
   static bool wasConnected = false;
 
   const uint32_t nowMs = millis();
-  const bool connected = bleController.isConnected();
+  const bool connected = bleMouse.isConnected();
 
   if (connected && !wasConnected)
   {
@@ -1056,12 +800,19 @@ void loop()
   }
   if (!connected && wasConnected)
   {
-    Serial.println("BLE disconnected.");
+    BLEDevice::startAdvertising();
+    lastAdvertiseKickMs = nowMs;
+    Serial.println("BLE disconnected. Re-advertising...");
   }
   wasConnected = connected;
 
   if (!connected)
   {
+    if (nowMs - lastAdvertiseKickMs > 5000)
+    {
+      BLEDevice::startAdvertising();
+      lastAdvertiseKickMs = nowMs;
+    }
     if (nowMs - lastStatusMs > 2000)
     {
       Serial.println("Waiting for BLE...");
@@ -1126,7 +877,7 @@ void loop()
   const float cursorY = rawY * cfg.gainY * (cfg.invertY ? -1.f : 1.f);
   const float tiltV = rawTilt * (cfg.invertClick ? -1.f : 1.f);
 
-  detectGestures(nowMs, mouseReportsEnabled);
+  detectGestures(nowMs);
 
   // Placeholder only: keep threshold checks but intentionally do nothing for now.
   const bool tiltPastNegative = mouseReportsEnabled && (tiltV < -cfg.tiltThreshDeg);
@@ -1139,7 +890,7 @@ void loop()
 
   if (mouseReportsEnabled && (moveX != 0 || moveY != 0) && (nowMs - lastReportMs >= BLE_REPORT_INTERVAL_MS))
   {
-    bleController.mouseMove(static_cast<int8_t>(moveX), static_cast<int8_t>(moveY));
+    bleMouse.move(static_cast<int8_t>(moveX), static_cast<int8_t>(moveY));
     lastReportMs = nowMs;
   }
 }

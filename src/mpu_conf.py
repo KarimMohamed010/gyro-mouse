@@ -12,15 +12,6 @@ import serial, serial.tools.list_ports
 # ─────────────────────────────────────────────────────────────────────────────
 AXIS_NAMES  = ["Yaw (0)", "Pitch (1)", "Roll (2)"]
 SAVE_FILE   = "mpu_config.json"
-KEYMAP_PRESETS = [
-    "NONE",
-    "ALT+TAB",
-    "CTRL+C",
-    "CTRL+V",
-    "CTRL+Z",
-    "CTRL+SHIFT+ESC",
-    "WIN+TAB",
-]
 
 DEFAULT_CFG = {
     "cursorXAxis": 0, "cursorYAxis": 2, "clickAxis": 1,
@@ -32,19 +23,7 @@ DEFAULT_CFG = {
     "shakeVelThresh": 60.0, "doubleTiltDeg": 25.0, "circleMinSpeed": 20.0,
     "enableFlick": True, "enableShake": True,
     "enableDoubleTilt": True, "enableCircle": True,
-    "shortcutFlick": "NONE",
-    "shortcutShake": "ALT+TAB",
-    "shortcutDoubleTilt": "NONE",
-    "shortcutCircle": "NONE",
 }
-
-
-def normalize_shortcut(value):
-    txt = "" if value is None else str(value)
-    txt = txt.strip().upper().replace(" ", "")
-    if txt in ("", "OFF", "DISABLED"):
-        return "NONE"
-    return txt
 
 C = {
     "bg0":    "#0d0f12", "bg1": "#13161b", "bg2": "#1a1e25", "bg3": "#222733",
@@ -91,7 +70,7 @@ class SerialThread(threading.Thread):
                     elif "gesture" in msg: self.on_gesture(msg)
                     elif "ack" in msg:     self.on_status("ack")
                 except json.JSONDecodeError:
-                    self._handle_non_json_line(raw)
+                    pass
         except serial.SerialException as e:
             self.on_status(f"error:{e}")
         finally:
@@ -104,29 +83,6 @@ class SerialThread(threading.Thread):
 
     def stop(self):
         self._stop.set()
-
-    def _handle_non_json_line(self, raw):
-        if raw.startswith("ml_gestures,"):
-            parts = raw.split(",")
-            if len(parts) >= 3:
-                self.on_gesture({"gesture": f"ML:{parts[1]}", "axis": f"score={parts[2]}"})
-            return
-
-        axes = self._parse_csv_axes(raw)
-        if axes is not None:
-            self.on_data(axes)
-
-    @staticmethod
-    def _parse_csv_axes(raw):
-        parts = raw.split(",")
-        if len(parts) < 9:
-            return None
-        try:
-            vals = [float(p) for p in parts[:9]]
-        except ValueError:
-            return None
-        # Firmware streams: ax,ay,az,gx,gy,gz,yaw,pitch,roll
-        return [vals[6], vals[7], vals[8]]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -485,36 +441,6 @@ class App(tk.Tk):
 
         tk.Frame(p, bg=C["border"], height=1).pack(fill="x", pady=(2, 6))
 
-        # Gesture shortcut keymap
-        self.keymap_vars = {}
-        keymap_box = tk.Frame(p, bg=C["bg1"])
-        keymap_box.pack(fill="x", pady=(0, 6))
-
-        tk.Label(keymap_box, text="KEYMAP", bg=C["bg1"], fg=C["accent"],
-                 font=("Consolas", 8, "bold")).pack(anchor="w", pady=(0, 3))
-
-        keymap_specs = [
-            ("shortcutFlick", "Flick"),
-            ("shortcutShake", "Shake"),
-            ("shortcutDoubleTilt", "Double-Tilt"),
-            ("shortcutCircle", "Circle"),
-        ]
-        for key, label in keymap_specs:
-            row = tk.Frame(keymap_box, bg=C["bg1"])
-            row.pack(fill="x", pady=1)
-            tk.Label(row, text=f"{label}", bg=C["bg1"], fg=C["text1"],
-                     font=FONT_TINY, width=12, anchor="w").pack(side="left")
-            var = tk.StringVar(value=normalize_shortcut(self.cfg.get(key, "NONE")))
-            cb = ttk.Combobox(row, textvariable=var, values=KEYMAP_PRESETS,
-                              width=20, state="normal")
-            cb.pack(side="left", padx=(4, 0), fill="x", expand=True)
-            self.keymap_vars[key] = var
-
-        tk.Label(keymap_box, text="Use '+' between modifiers and key (example: ALT+TAB).",
-                 bg=C["bg1"], fg=C["text2"], font=FONT_TINY).pack(anchor="w", pady=(3, 0))
-
-        tk.Frame(p, bg=C["border"], height=1).pack(fill="x", pady=(2, 6))
-
         specs = [
             ("tiltThreshDeg", "Tilt threshold", "°",    5,  90,  0.5),
             ("flickVelThresh","Flick speed",    "°/s", 40, 400,  5.0),
@@ -607,8 +533,6 @@ class App(tk.Tk):
             v.set(self.cfg.get(k, False))
         for k, v in self.gesture_toggle_vars.items():
             v.set(self.cfg.get(k, True))
-        for k, v in self.keymap_vars.items():
-            v.set(normalize_shortcut(self.cfg.get(k, "NONE")))
         for k, sl in self.dead_sliders.items():
             val = self.cfg.get(k, 1.5); sl.set(val); self.dead_vizzes[k].set_dead(val)
         for k, sl in self.gain_sliders.items():
@@ -622,7 +546,6 @@ class App(tk.Tk):
             except ValueError: pass
         for k, v in self.invert_vars.items():  self.cfg[k] = v.get()
         for k, v in self.gesture_toggle_vars.items(): self.cfg[k] = v.get()
-        for k, v in self.keymap_vars.items(): self.cfg[k] = normalize_shortcut(v.get())
         for k, sl in self.dead_sliders.items(): self.cfg[k] = sl.get()
         for k, sl in self.gain_sliders.items(): self.cfg[k] = sl.get()
         for k, sl in self.thresh_sliders.items(): self.cfg[k] = sl.get()
@@ -634,7 +557,6 @@ class App(tk.Tk):
 
     def _set_status(self, code):
         if   code == "connected":    text, col = "CONNECTED",     C["green"]
-        elif code == "connecting":   text, col = "CONNECTING...", C["amber"]
         elif code == "ack":          text, col = "CFG APPLIED ✓", C["green"]
         elif code == "no_response":  text, col = "NO RESPONSE",   C["amber"]
         elif code.startswith("error:"): text, col = "ERROR",      C["red"]
@@ -643,15 +565,7 @@ class App(tk.Tk):
         self.led.itemconfig(self._led, fill=col)
 
     def _log_gesture(self, msg):
-        shortcut = msg.get("shortcut", "")
-        shortcut_sent = msg.get("shortcutSent", None)
-        suffix = ""
-        if shortcut:
-            if shortcut_sent is None:
-                suffix = f"  -> {shortcut}"
-            else:
-                suffix = f"  -> {shortcut} [{'sent' if int(shortcut_sent) else 'queued'}]"
-        text = f"[{time.strftime('%H:%M:%S')}]  {msg.get('gesture','?'):<12}{msg.get('axis','')}{suffix}\n"
+        text = f"[{time.strftime('%H:%M:%S')}]  {msg.get('gesture','?'):<12}{msg.get('axis','')}\n"
         self.gesture_log.configure(state="normal")
         self.gesture_log.insert("end", text)
         self.gesture_log.see("end")
@@ -682,14 +596,7 @@ class App(tk.Tk):
     def _apply(self):
         self._widgets_to_cfg()
         if self.serial and self.serial.connected:
-            payload_cfg = dict(self.cfg)
-            payload_cfg["keymap"] = {
-                "flick": payload_cfg.get("shortcutFlick", "NONE"),
-                "shake": payload_cfg.get("shortcutShake", "NONE"),
-                "doubleTilt": payload_cfg.get("shortcutDoubleTilt", "NONE"),
-                "circle": payload_cfg.get("shortcutCircle", "NONE"),
-            }
-            self.serial.send({"cfg": payload_cfg})
+            self.serial.send({"cfg": self.cfg})
         else:
             messagebox.showinfo("Not connected", "Connect to ESP32 first.")
 
