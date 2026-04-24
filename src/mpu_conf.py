@@ -18,7 +18,7 @@ DEFAULT_CFG = {
     "invertX": False, "invertY": False, "invertClick": False,
     "deadzoneX": 1.5, "deadzoneY": 1.5, "deadzoneClick": 2.0,
     "gainX": 0.3, "gainY": 0.3,
-    "tiltThreshDeg": 30.0,
+    "clickThreshDeg": 30.0,
     "flickVelThresh": 120.0, "flickReturnDeg": 8.0, "flickConfirmMs": 300,
     "shakeVelThresh": 60.0, "doubleTiltDeg": 25.0, "circleMinSpeed": 20.0,
     "enableFlick": True, "enableShake": True,
@@ -442,7 +442,7 @@ class App(tk.Tk):
         tk.Frame(p, bg=C["border"], height=1).pack(fill="x", pady=(2, 6))
 
         specs = [
-            ("tiltThreshDeg", "Tilt threshold", "°",    5,  90,  0.5),
+            ("clickThreshDeg","Click angle",    "°",    5,  90,  0.5),
             ("flickVelThresh","Flick speed",    "°/s", 40, 400,  5.0),
             ("flickReturnDeg","Flick return",   "°",    1,  30,  0.5),
             ("flickConfirmMs","Flick window",   "ms",  80, 800, 10.0),
@@ -609,11 +609,6 @@ class App(tk.Tk):
         try:
             with open(SAVE_FILE) as f: self.cfg.update(json.load(f))
         except (FileNotFoundError, json.JSONDecodeError): pass
-        if "tiltThreshDeg" not in self.cfg and "clickThreshDeg" in self.cfg:
-            self.cfg["tiltThreshDeg"] = self.cfg["clickThreshDeg"]
-        self.cfg.pop("clickThreshDeg", None)
-        for k in ["shortcutFlick", "shortcutShake", "shortcutDoubleTilt", "shortcutCircle"]:
-            self.cfg[k] = normalize_shortcut(self.cfg.get(k, DEFAULT_CFG[k]))
 
     def _load_and_apply(self):
         self._load_config(); self._apply_cfg_to_widgets(); self._apply()
