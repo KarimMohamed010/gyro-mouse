@@ -4,8 +4,12 @@
 #include <Wire.h>
 #include <BleMouse.h>
 #include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLECharacteristic.h>
+#include <BLE2902.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <string>
 
 #include "model_data.h"
 
@@ -34,7 +38,7 @@ constexpr uint8_t SHAKE_REVERSALS_REQUIRED = 4;
 constexpr uint8_t CIRCLE_FRAMES_REQUIRED = 12;
 
 // ── Streaming and inference settings ─────────────────────────────────────────
-constexpr uint16_t SERIAL_STREAM_INTERVAL_MS = 20; // ~50 Hz
+constexpr uint16_t RAW_STREAM_INTERVAL_MS = 20; // ~50 Hz
 constexpr uint16_t INFERENCE_STRIDE_SAMPLES = 10;  // run every 10 new samples
 
 // ── Axis indices ──────────────────────────────────────────────────────────────
@@ -46,6 +50,17 @@ constexpr uint8_t AXIS_ROLL = 2;
 
 constexpr int kFeatureCount = 9; // ax,ay,az,gx,gy,gz,yaw,pitch,roll
 constexpr int kWindowSize = 100;
+
+// ── BLE GATT transport UUIDs ────────────────────────────────────────────────
+constexpr char kDataServiceUuid[] = "12345678-1234-1234-1234-1234567890ab";
+constexpr char kRawDataCharUuid[] = "abcd0001-5678-1234-5678-1234567890ab";
+constexpr char kGestureCharUuid[] = "abcd0002-5678-1234-5678-1234567890ab";
+constexpr char kMlCharUuid[] = "abcd0003-5678-1234-5678-1234567890ab";
+constexpr char kConfigCharUuid[] = "abcd0004-5678-1234-5678-1234567890ab";
+
+constexpr uint8_t PKT_RAW = 0x01;
+constexpr uint8_t PKT_GESTURE = 0x02;
+constexpr uint8_t PKT_ML = 0x03;
 
 #if __has_include("feature_norm.h")
 #include "feature_norm.h"
@@ -82,7 +97,7 @@ constexpr float kFeatureStd[kFeatureCount] = {
 constexpr const char *kMlGestureLabels[] = {"swipe", "shake", "circle", "wave", "idle"};
 constexpr int kMlLabelCount = sizeof(kMlGestureLabels) / sizeof(kMlGestureLabels[0]);
 
-// ── User config (runtime, overwritten by GUI via Serial) ─────────────────────
+// ── User config (runtime, updated over BLE config characteristic) ───────────
 struct Config
 {
   // Axis mapping: which DMP axis drives each function
@@ -120,9 +135,98 @@ struct Config
   bool enableShake = true;
   bool enableDoubleTilt = true;
   bool enableCircle = true;
-} cfg;
+};
+
+const Config kDefaultConfig = Config{};
+Config cfg = kDefaultConfig;
 
 Preferences prefs;
+
+BLEServer *gBleServer = nullptr;
+BLEService *gDataService = nullptr;
+BLECharacteristic *gRawDataChar = nullptr;
+BLECharacteristic *gGestureChar = nullptr;
+BLECharacteristic *gMlChar = nullptr;
+BLECharacteristic *gConfigChar = nullptr;
+
+// BLE connection state — updated by BLEServerCallbacks
+volatile bool gBleClientConnected = false;
+
+void applyConfigMessage(const std::string &payload);
+void updateConfigCharacteristic();
+void notifyConfigAck(const char *ack);
+void notifyRawData(int16_t ax, int16_t ay, int16_t az,
+                   int16_t gx, int16_t gy, int16_t gz,
+                   float yaw, float pitch, float roll);
+void notifyGestureEvent(const char *gesture, const char *axis);
+void notifyMlPrediction(const char *label, float score);
+
+// ── BLE Server callbacks — track connect/disconnect ──────────────────────────
+class GattServerCallbacks : public BLEServerCallbacks
+{
+public:
+  void onConnect(BLEServer *) override    { gBleClientConnected = true; }
+  void onDisconnect(BLEServer *) override
+  {
+    gBleClientConnected = false;
+    BLEDevice::startAdvertising();
+  }
+};
+
+class ConfigCharacteristicCallbacks : public BLECharacteristicCallbacks
+{
+public:
+  void onWrite(BLECharacteristic *characteristic) override
+  {
+    const std::string payload = characteristic->getValue();
+    if (!payload.empty())
+      applyConfigMessage(payload);
+  }
+};
+
+void setupDataTransportService(BLEServer *server)
+{
+  gBleServer = server;
+  server->setCallbacks(new GattServerCallbacks());
+
+  gDataService = server->createService(kDataServiceUuid);
+
+  gRawDataChar = gDataService->createCharacteristic(
+      kRawDataCharUuid,
+      BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
+  gRawDataChar->addDescriptor(new BLE2902());
+
+  gGestureChar = gDataService->createCharacteristic(
+      kGestureCharUuid,
+      BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
+  gGestureChar->addDescriptor(new BLE2902());
+
+  gMlChar = gDataService->createCharacteristic(
+      kMlCharUuid,
+      BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
+  gMlChar->addDescriptor(new BLE2902());
+
+  gConfigChar = gDataService->createCharacteristic(
+      kConfigCharUuid,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
+  gConfigChar->addDescriptor(new BLE2902());
+  gConfigChar->setCallbacks(new ConfigCharacteristicCallbacks());
+
+  gDataService->start();
+  server->getAdvertising()->addServiceUUID(kDataServiceUuid);
+}
+
+class BleMouseWithDataService : public BleMouse
+{
+public:
+  using BleMouse::BleMouse;
+
+protected:
+  void onStarted(BLEServer *server) override
+  {
+    setupDataTransportService(server);
+  }
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 inline int8_t signOf(float v)
@@ -242,9 +346,7 @@ void detectGestures(uint32_t nowMs)
         {
           if (!onCooldown)
           {
-            Serial.print("{\"gesture\":\"Flick\",\"axis\":\"");
-            Serial.print(fa.direction > 0 ? AXIS_POS[i] : AXIS_NEG[i]);
-            Serial.println("\"}");
+            notifyGestureEvent("Flick", fa.direction > 0 ? AXIS_POS[i] : AXIS_NEG[i]);
             gs.lastGestureMs = nowMs;
           }
           fa.phase = 0;
@@ -280,9 +382,7 @@ void detectGestures(uint32_t nowMs)
           gs.shakeCount[i]++;
           if (gs.shakeCount[i] >= SHAKE_REVERSALS_REQUIRED && !onCooldown)
           {
-            Serial.print("{\"gesture\":\"Shake\",\"axis\":\"");
-            Serial.print(AXIS_NAMES[i]);
-            Serial.println("\"}");
+            notifyGestureEvent("Shake", AXIS_NAMES[i]);
             gs.lastGestureMs = nowMs;
             gs.shakeCount[i] = 0;
           }
@@ -327,9 +427,7 @@ void detectGestures(uint32_t nowMs)
           {
             if (!onCooldown)
             {
-              Serial.print("{\"gesture\":\"DoubleTilt\",\"axis\":\"");
-              Serial.print(d == 0 ? AXIS_NEG[i] : AXIS_POS[i]);
-              Serial.println("\"}");
+              notifyGestureEvent("DoubleTilt", d == 0 ? AXIS_NEG[i] : AXIS_POS[i]);
               gs.lastGestureMs = nowMs;
             }
             gs.doubleTiltFirstMs[i][d] = 0;
@@ -380,7 +478,7 @@ void detectGestures(uint32_t nowMs)
       gs.circleSignB = sb;
       if (gs.circleFrames >= CIRCLE_FRAMES_REQUIRED && !onCooldown)
       {
-        Serial.println("{\"gesture\":\"Circle\"}");
+        notifyGestureEvent("Circle", "");
         gs.lastGestureMs = nowMs;
         gs.circleFrames = 0;
       }
@@ -398,87 +496,148 @@ void detectGestures(uint32_t nowMs)
   }
 }
 
-// ── Serial config parser ─────────────────────────────────────────────────────
-void handleSerial()
+// ── BLE notify helpers ────────────────────────────────────────────────────────
+
+// Send ack/pong string on the config characteristic (notify)
+void notifyConfigAck(const char *ack)
 {
-  if (!Serial.available())
-    return;
+  if (!gBleClientConnected || !gConfigChar) return;
+  gConfigChar->setValue((uint8_t *)ack, strlen(ack));
+  gConfigChar->notify();
+}
 
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  if (line.length() == 0)
-    return;
+// Serialise current cfg to JSON and cache it on the config characteristic
+void updateConfigCharacteristic()
+{
+  if (!gConfigChar) return;
+  JsonDocument doc;
+  JsonObject c = doc["cfg"].to<JsonObject>();
+  c["cursorXAxis"]   = cfg.cursorXAxis;
+  c["cursorYAxis"]   = cfg.cursorYAxis;
+  c["clickAxis"]     = cfg.clickAxis;
+  c["invertX"]       = cfg.invertX;
+  c["invertY"]       = cfg.invertY;
+  c["invertClick"]   = cfg.invertClick;
+  c["deadzoneX"]     = cfg.deadzoneX;
+  c["deadzoneY"]     = cfg.deadzoneY;
+  c["deadzoneClick"] = cfg.deadzoneClick;
+  c["gainX"]         = cfg.gainX;
+  c["gainY"]         = cfg.gainY;
+  c["tiltThreshDeg"] = cfg.tiltThreshDeg;
+  c["flickVelThresh"]  = cfg.flickVelThresh;
+  c["flickReturnDeg"]  = cfg.flickReturnDeg;
+  c["flickConfirmMs"]  = cfg.flickConfirmMs;
+  c["shakeVelThresh"]  = cfg.shakeVelThresh;
+  c["doubleTiltDeg"]   = cfg.doubleTiltDeg;
+  c["circleMinSpeed"]  = cfg.circleMinSpeed;
+  c["enableFlick"]       = cfg.enableFlick;
+  c["enableShake"]       = cfg.enableShake;
+  c["enableDoubleTilt"]  = cfg.enableDoubleTilt;
+  c["enableCircle"]      = cfg.enableCircle;
+  char buf[512];
+  serializeJson(doc, buf, sizeof(buf));
+  gConfigChar->setValue((uint8_t *)buf, strlen(buf));
+}
 
-  if (line == "{\"ping\":1}")
+// Send gesture JSON on gesture characteristic (notify)
+void notifyGestureEvent(const char *gesture, const char *axis)
+{
+  if (!gBleClientConnected || !gGestureChar) return;
+  char buf[96];
+  if (axis && axis[0])
+    snprintf(buf, sizeof(buf), "{\"gesture\":\"%s\",\"axis\":\"%s\"}", gesture, axis);
+  else
+    snprintf(buf, sizeof(buf), "{\"gesture\":\"%s\"}", gesture);
+  gGestureChar->setValue((uint8_t *)buf, strlen(buf));
+  gGestureChar->notify();
+}
+
+// Send ML prediction on ml characteristic (notify)
+void notifyMlPrediction(const char *label, float score)
+{
+  if (!gBleClientConnected || !gMlChar) return;
+  char buf[64];
+  snprintf(buf, sizeof(buf), "ml_gestures,%s,%.4f", label, score);
+  gMlChar->setValue((uint8_t *)buf, strlen(buf));
+  gMlChar->notify();
+}
+
+// Send raw IMU + orientation data (binary, 19 bytes) on raw data characteristic
+// Format: [0x01][int16 ax][int16 ay][int16 az][int16 gx][int16 gy][int16 gz]
+//         [int16 yaw*100][int16 pitch*100][int16 roll*100]
+void notifyRawData(int16_t ax, int16_t ay, int16_t az,
+                   int16_t gx, int16_t gy, int16_t gz,
+                   float yaw, float pitch, float roll)
+{
+  if (!gBleClientConnected || !gRawDataChar) return;
+  uint8_t buf[19];
+  buf[0] = PKT_RAW;
+  auto wi = [&](int offset, int16_t v)
   {
-    Serial.println("{\"pong\":1}");
+    buf[offset]     = (uint8_t)(v & 0xFF);
+    buf[offset + 1] = (uint8_t)((v >> 8) & 0xFF);
+  };
+  wi(1,  ax); wi(3,  ay); wi(5,  az);
+  wi(7,  gx); wi(9,  gy); wi(11, gz);
+  wi(13, (int16_t)constrain((int)(yaw   * 100.f), -32767, 32767));
+  wi(15, (int16_t)constrain((int)(pitch * 100.f), -32767, 32767));
+  wi(17, (int16_t)constrain((int)(roll  * 100.f), -32767, 32767));
+  gRawDataChar->setValue(buf, sizeof(buf));
+  gRawDataChar->notify();
+}
+
+// ── BLE config write handler (replaces handleSerial) ─────────────────────────
+void applyConfigMessage(const std::string &payload)
+{
+  // Ping-pong
+  if (payload == "{\"ping\":1}")
+  {
+    notifyConfigAck("{\"pong\":1}");
     return;
   }
 
   JsonDocument doc;
-  if (deserializeJson(doc, line) != DeserializationError::Ok)
+  if (deserializeJson(doc, payload) != DeserializationError::Ok)
     return;
-  // Support explicit save command: {"save":1}
+
+  // Explicit save command: {"save":1}
   if (doc["save"].is<int>() && doc["save"].as<int>() == 1)
   {
     saveConfig();
-    Serial.println("{\"ack\":\"saved\"}");
+    notifyConfigAck("{\"ack\":\"saved\"}");
     return;
   }
-  if (!doc["cfg"].is<JsonObject>())
-    return;
 
+  if (!doc["cfg"].is<JsonObject>()) return;
   JsonObject c = doc["cfg"].as<JsonObject>();
-  if (c["cursorXAxis"].is<uint8_t>())
-    cfg.cursorXAxis = c["cursorXAxis"].as<uint8_t>();
-  if (c["cursorYAxis"].is<uint8_t>())
-    cfg.cursorYAxis = c["cursorYAxis"].as<uint8_t>();
-  if (c["clickAxis"].is<uint8_t>())
-    cfg.clickAxis = c["clickAxis"].as<uint8_t>();
-  if (c["invertX"].is<bool>())
-    cfg.invertX = c["invertX"].as<bool>();
-  if (c["invertY"].is<bool>())
-    cfg.invertY = c["invertY"].as<bool>();
-  if (c["invertClick"].is<bool>())
-    cfg.invertClick = c["invertClick"].as<bool>();
-  if (c["deadzoneX"].is<float>())
-    cfg.deadzoneX = c["deadzoneX"].as<float>();
-  if (c["deadzoneY"].is<float>())
-    cfg.deadzoneY = c["deadzoneY"].as<float>();
-  if (c["deadzoneClick"].is<float>())
-    cfg.deadzoneClick = c["deadzoneClick"].as<float>();
-  if (c["gainX"].is<float>())
-    cfg.gainX = c["gainX"].as<float>();
-  if (c["gainY"].is<float>())
-    cfg.gainY = c["gainY"].as<float>();
-  if (c["tiltThreshDeg"].is<float>())
-    cfg.tiltThreshDeg = c["tiltThreshDeg"].as<float>();
-  else if (c["clickThreshDeg"].is<float>())
-    cfg.tiltThreshDeg = c["clickThreshDeg"].as<float>();
-  if (c["flickVelThresh"].is<float>())
-    cfg.flickVelThresh = c["flickVelThresh"].as<float>();
-  if (c["flickReturnDeg"].is<float>())
-    cfg.flickReturnDeg = c["flickReturnDeg"].as<float>();
-  if (c["flickConfirmMs"].is<uint16_t>())
-    cfg.flickConfirmMs = c["flickConfirmMs"].as<uint16_t>();
-  if (c["shakeVelThresh"].is<float>())
-    cfg.shakeVelThresh = c["shakeVelThresh"].as<float>();
-  if (c["doubleTiltDeg"].is<float>())
-    cfg.doubleTiltDeg = c["doubleTiltDeg"].as<float>();
-  if (c["circleMinSpeed"].is<float>())
-    cfg.circleMinSpeed = c["circleMinSpeed"].as<float>();
-  if (c["enableFlick"].is<bool>())
-    cfg.enableFlick = c["enableFlick"].as<bool>();
-  if (c["enableShake"].is<bool>())
-    cfg.enableShake = c["enableShake"].as<bool>();
-  if (c["enableDoubleTilt"].is<bool>())
-    cfg.enableDoubleTilt = c["enableDoubleTilt"].as<bool>();
-  if (c["enableCircle"].is<bool>())
-    cfg.enableCircle = c["enableCircle"].as<bool>();
 
-  // Auto-save after applying new config so changes persist immediately
+  if (c["cursorXAxis"].is<uint8_t>())   cfg.cursorXAxis  = c["cursorXAxis"].as<uint8_t>();
+  if (c["cursorYAxis"].is<uint8_t>())   cfg.cursorYAxis  = c["cursorYAxis"].as<uint8_t>();
+  if (c["clickAxis"].is<uint8_t>())     cfg.clickAxis    = c["clickAxis"].as<uint8_t>();
+  if (c["invertX"].is<bool>())          cfg.invertX      = c["invertX"].as<bool>();
+  if (c["invertY"].is<bool>())          cfg.invertY      = c["invertY"].as<bool>();
+  if (c["invertClick"].is<bool>())      cfg.invertClick  = c["invertClick"].as<bool>();
+  if (c["deadzoneX"].is<float>())       cfg.deadzoneX    = c["deadzoneX"].as<float>();
+  if (c["deadzoneY"].is<float>())       cfg.deadzoneY    = c["deadzoneY"].as<float>();
+  if (c["deadzoneClick"].is<float>())   cfg.deadzoneClick= c["deadzoneClick"].as<float>();
+  if (c["gainX"].is<float>())           cfg.gainX        = c["gainX"].as<float>();
+  if (c["gainY"].is<float>())           cfg.gainY        = c["gainY"].as<float>();
+  if (c["tiltThreshDeg"].is<float>())   cfg.tiltThreshDeg= c["tiltThreshDeg"].as<float>();
+  else if (c["clickThreshDeg"].is<float>()) cfg.tiltThreshDeg = c["clickThreshDeg"].as<float>();
+  if (c["flickVelThresh"].is<float>())  cfg.flickVelThresh  = c["flickVelThresh"].as<float>();
+  if (c["flickReturnDeg"].is<float>())  cfg.flickReturnDeg  = c["flickReturnDeg"].as<float>();
+  if (c["flickConfirmMs"].is<uint16_t>()) cfg.flickConfirmMs = c["flickConfirmMs"].as<uint16_t>();
+  if (c["shakeVelThresh"].is<float>())  cfg.shakeVelThresh  = c["shakeVelThresh"].as<float>();
+  if (c["doubleTiltDeg"].is<float>())   cfg.doubleTiltDeg   = c["doubleTiltDeg"].as<float>();
+  if (c["circleMinSpeed"].is<float>())  cfg.circleMinSpeed  = c["circleMinSpeed"].as<float>();
+  if (c["enableFlick"].is<bool>())      cfg.enableFlick      = c["enableFlick"].as<bool>();
+  if (c["enableShake"].is<bool>())      cfg.enableShake      = c["enableShake"].as<bool>();
+  if (c["enableDoubleTilt"].is<bool>()) cfg.enableDoubleTilt = c["enableDoubleTilt"].as<bool>();
+  if (c["enableCircle"].is<bool>())     cfg.enableCircle     = c["enableCircle"].as<bool>();
+
   saveConfig();
-  Serial.println("{\"ack\":\"cfg\"}");
+  updateConfigCharacteristic();
+  notifyConfigAck("{\"ack\":\"cfg\"}");
 }
 
 // ── MPU/DMP objects ─────────────────────────────────────────────────────────
@@ -526,15 +685,9 @@ namespace ml_gestures
   {
     model = tflite::GetModel(g_gesture_model_data);
     if (!model)
-    {
-      Serial.println("TFLM model pointer is null.");
       return false;
-    }
     if (model->version() != TFLITE_SCHEMA_VERSION)
-    {
-      Serial.println("TFLM model schema version mismatch.");
       return false;
-    }
 
     static tflite::MicroMutableOpResolver<18> opResolver;
     opResolver.AddReshape();
@@ -560,22 +713,14 @@ namespace ml_gestures
     interpreter = &staticInterpreter;
 
     if (interpreter->AllocateTensors() != kTfLiteOk)
-    {
-      Serial.println("AllocateTensors failed.");
       return false;
-    }
 
     inputTensor = interpreter->input(0);
     outputTensor = interpreter->output(0);
 
     if (!inputTensor || !outputTensor)
-    {
-      Serial.println("Input/output tensor missing.");
       return false;
-    }
 
-    Serial.print("TFLM ready. Arena bytes: ");
-    Serial.println(kTensorArenaSize);
     return true;
   }
 
@@ -585,14 +730,7 @@ namespace ml_gestures
     const int expectedElements = kWindowSize * kFeatureCount;
     if (inputElements != expectedElements)
     {
-      if (!tflmWarned)
-      {
-        Serial.print("Input shape mismatch. expected=");
-        Serial.print(expectedElements);
-        Serial.print(" got=");
-        Serial.println(inputElements);
-        tflmWarned = true;
-      }
+      tflmWarned = true;
       return;
     }
 
@@ -634,10 +772,7 @@ namespace ml_gestures
     fillModelInputFromRing();
 
     if (interpreter->Invoke() != kTfLiteOk)
-    {
-      Serial.println("Inference failed.");
       return;
-    }
 
     const int outCount = outputTensor->dims->data[outputTensor->dims->size - 1];
     if (outCount <= 0)
@@ -668,18 +803,14 @@ namespace ml_gestures
       }
     }
 
-    Serial.print("ml_gestures,");
+    char labelBuf[32];
     if (bestIdx >= 0 && bestIdx < kMlLabelCount)
-    {
-      Serial.print(kMlGestureLabels[bestIdx]);
-    }
+      notifyMlPrediction(kMlGestureLabels[bestIdx], bestScore);
     else
     {
-      Serial.print("class_");
-      Serial.print(bestIdx);
+      snprintf(labelBuf, sizeof(labelBuf), "class_%d", bestIdx);
+      notifyMlPrediction(labelBuf, bestScore);
     }
-    Serial.print(",");
-    Serial.println(bestScore, 4);
   }
 #endif
 
@@ -698,8 +829,6 @@ namespace ml_gestures
   {
 #if HAS_TFLM
     tflmReady = setupTFLM();
-#else
-    Serial.println("ml_gestures: TensorFlow Lite Micro headers not found. Disabled.");
 #endif
   }
 
@@ -723,22 +852,17 @@ void setup()
 {
   Wire.begin();
   Wire.setClock(400000);
-  Serial.begin(115200);
-  while (!Serial)
-    ;
 
   // Load persisted config (if any)
   loadConfig();
 
   pinMode(INTERRUPT_PIN, INPUT);
 
-  Serial.println("Initializing MPU6050...");
   mpu.initialize();
   if (!mpu.testConnection())
   {
-    Serial.println("MPU6050 connection failed.");
-    while (true)
-      ;
+    // MPU connection failed — halt; BLE client will see no data
+    while (true) delay(1000);
   }
 
   devStatus = mpu.dmpInitialize();
@@ -751,29 +875,23 @@ void setup()
 
   if (devStatus == 0)
   {
-    Serial.println("Calibrating MPU6050... keep sensor still");
     mpu.CalibrateAccel(6);
     mpu.CalibrateGyro(6);
     mpu.setDMPEnabled(true);
     attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
     dmpReady = true;
-    Serial.println("DMP ready.");
   }
   else
   {
-    Serial.print("DMP init failed code=");
-    Serial.println(devStatus);
-    while (true)
-      ;
+    // DMP init failed — halt
+    while (true) delay(1000);
   }
 
   bleMouse.begin();
-  Serial.println("BLE advertising as: ESP32 MPU Mouse");
   ml_gestures::setup();
 
-  Serial.println("Output format:");
-  Serial.println("  RAW: ax,ay,az,gx,gy,gz,yaw,pitch,roll");
-  Serial.println("  PRED: ml_gestures,<label>,<score>");
+  // Publish initial config to BLE characteristic so client can read it on connect
+  updateConfigCharacteristic();
 }
 
 void loop()
@@ -781,9 +899,6 @@ void loop()
   if (!dmpReady)
     return;
 
-  handleSerial();
-
-  static uint32_t lastStatusMs = 0;
   static uint32_t lastAdvertiseKickMs = 0;
   static uint32_t connectedSinceMs = 0;
   static uint32_t lastReportMs = 0;
@@ -796,34 +911,20 @@ void loop()
   {
     connectedSinceMs = nowMs;
     lastReportMs = nowMs;
-    Serial.println("BLE connected.");
   }
-  if (!connected && wasConnected)
+  // Advertising restart on disconnect is handled by GattServerCallbacks::onDisconnect.
+  // Kick it periodically as a safety net while disconnected.
+  if (!connected && (nowMs - lastAdvertiseKickMs > 5000))
   {
     BLEDevice::startAdvertising();
     lastAdvertiseKickMs = nowMs;
-    Serial.println("BLE disconnected. Re-advertising...");
   }
   wasConnected = connected;
-
-  if (!connected)
-  {
-    if (nowMs - lastAdvertiseKickMs > 5000)
-    {
-      BLEDevice::startAdvertising();
-      lastAdvertiseKickMs = nowMs;
-    }
-    if (nowMs - lastStatusMs > 2000)
-    {
-      Serial.println("Waiting for BLE...");
-      lastStatusMs = nowMs;
-    }
-  }
 
   const bool mouseReportsEnabled = connected && ((nowMs - connectedSinceMs) >= BLE_POST_CONNECT_DELAY_MS);
 
   static uint32_t lastSampleMs = 0;
-  if ((nowMs - lastSampleMs) < SERIAL_STREAM_INTERVAL_MS)
+  if ((nowMs - lastSampleMs) < RAW_STREAM_INTERVAL_MS)
     return;
 
   if (!mpu.dmpGetCurrentFIFOPacket(fifoBuffer))
@@ -857,14 +958,8 @@ void loop()
       roll,
   };
 
-  // Stream raw features for recording/debugging.
-  Serial.print(sample[0], 3);
-  for (int i = 1; i < kFeatureCount; i++)
-  {
-    Serial.print(',');
-    Serial.print(sample[i], 3);
-  }
-  Serial.println();
+  // Stream raw features over BLE (binary packet, 19 bytes)
+  notifyRawData(aa.x, aa.y, aa.z, gg.x, gg.y, gg.z, yaw, pitch, roll);
 
   ml_gestures::onSample(sample);
 

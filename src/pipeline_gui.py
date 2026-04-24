@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Unified GUI for MPU6050 gesture pipeline:
-1) Record labeled gesture CSVs
+Unified GUI for MPU6050 gesture pipeline (BLE Version):
+1) Record labeled gesture CSVs over BLE
 2) Train models (LSTM + CNN)
 3) Deploy model/scaler artifacts to firmware sources
 """
@@ -14,6 +14,8 @@ import subprocess
 import sys
 import threading
 import time
+import asyncio
+import struct
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,75 +24,71 @@ from typing import Optional
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-import serial
-import serial.tools.list_ports
+from bleak import BleakClient, BleakScanner
 
 FEATURE_NAMES = ["ax", "ay", "az", "gx", "gy", "gz", "yaw", "pitch", "roll"]
 EXPECTED_FEATURE_COUNT = 9
 LABELS = ["swipe", "shake", "circle", "wave", "idle"]
 
+RAW_DATA_CHAR_UUID = "abcd0001-5678-1234-5678-1234567890ab"
 
 @dataclass
 class Sample:
     timestamp: float
     values: list[float]
 
-
-class SerialStreamThread(threading.Thread):
-    def __init__(self, port: str, baud: int, sample_queue: queue.Queue[Sample], error_queue: queue.Queue[str]):
+class BleStreamThread(threading.Thread):
+    def __init__(self, address: str, sample_queue: queue.Queue[Sample], error_queue: queue.Queue[str]):
         super().__init__(daemon=True)
-        self.port = port
-        self.baud = baud
+        self.address = address
         self.sample_queue = sample_queue
         self.error_queue = error_queue
-        self.stop_event = threading.Event()
-
-    @staticmethod
-    def parse_sample_line(line: str) -> Optional[list[float]]:
-        cleaned = line.strip()
-        if not cleaned:
-            return None
-
-        if cleaned.startswith("{") or cleaned.startswith("[") or cleaned.startswith("ml_gestures,"):
-            return None
-
-        parts = [p.strip() for p in cleaned.split(",")]
-        if len(parts) != EXPECTED_FEATURE_COUNT:
-            return None
-
-        try:
-            values = [float(p) for p in parts]
-        except ValueError:
-            return None
-
-        return values
+        self.stop_event = asyncio.Event()
 
     def run(self) -> None:
-        try:
-            with serial.Serial(self.port, self.baud, timeout=0.05) as ser:
-                while not self.stop_event.is_set():
-                    raw = ser.readline()
-                    if not raw:
-                        continue
-                    line = raw.decode("utf-8", errors="ignore")
-                    values = self.parse_sample_line(line)
-                    if values is None:
-                        continue
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._run_async())
 
-                    sample = Sample(timestamp=time.time(), values=values)
+    async def _run_async(self):
+        def raw_data_handler(sender, data):
+            if len(data) == 19 and data[0] == 0x01:
+                vals = struct.unpack("<9h", data[1:])
+                values = [
+                    float(vals[0]), float(vals[1]), float(vals[2]),
+                    float(vals[3]), float(vals[4]), float(vals[5]),
+                    vals[6] / 100.0, vals[7] / 100.0, vals[8] / 100.0
+                ]
+                sample = Sample(timestamp=time.time(), values=values)
+                try:
+                    self.sample_queue.put_nowait(sample)
+                except queue.Full:
                     try:
-                        self.sample_queue.put_nowait(sample)
-                    except queue.Full:
-                        try:
-                            self.sample_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                        self.sample_queue.put_nowait(sample)
+                        self.sample_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self.sample_queue.put_nowait(sample)
+
+        def on_disconnect(client):
+            self.error_queue.put("BLE disconnected unexpectedly.")
+            self.stop_event.set()
+
+        try:
+            async with BleakClient(self.address, disconnected_callback=on_disconnect) as client:
+                await client.start_notify(RAW_DATA_CHAR_UUID, raw_data_handler)
+                await self.stop_event.wait()
+                if client.is_connected:
+                    await client.stop_notify(RAW_DATA_CHAR_UUID)
         except Exception as exc:
-            self.error_queue.put(f"Serial stream error: {exc}")
+            self.error_queue.put(f"BLE stream error: {exc}")
 
     def stop(self) -> None:
-        self.stop_event.set()
+        def set_stop():
+            self.stop_event.set()
+        
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.call_soon_threadsafe(set_stop)
 
 
 class ProcessRunner:
@@ -143,7 +141,7 @@ class PipelineGUI(tk.Tk):
 
         self.sample_queue: queue.Queue[Sample] = queue.Queue(maxsize=4096)
         self.error_queue: queue.Queue[str] = queue.Queue(maxsize=32)
-        self.serial_thread: Optional[SerialStreamThread] = None
+        self.ble_thread: Optional[BleStreamThread] = None
 
         self.current_label = tk.StringVar(value="idle")
         self.recording = False
@@ -151,13 +149,14 @@ class PipelineGUI(tk.Tk):
         self.record_index = 1
         self.samples_seen = 0
 
+        self.device_addresses = {}
+
         self.train_log_queue: queue.Queue[str] = queue.Queue(maxsize=10000)
         self.deploy_log_queue: queue.Queue[str] = queue.Queue(maxsize=10000)
         self.train_runner = ProcessRunner(lambda s: self._queue_log(self.train_log_queue, s))
         self.deploy_runner = ProcessRunner(lambda s: self._queue_log(self.deploy_log_queue, s))
 
         self._build_ui()
-        self._refresh_ports()
         self._ui_pump()
 
     def _build_ui(self):
@@ -177,23 +176,18 @@ class PipelineGUI(tk.Tk):
         self._build_deploy_tab()
 
     def _build_record_tab(self):
-        top = tk.LabelFrame(self.record_tab, text="Serial Input")
+        top = tk.LabelFrame(self.record_tab, text="BLE Input")
         top.pack(fill="x", padx=8, pady=8)
 
-        self.port_var = tk.StringVar()
-        self.baud_var = tk.StringVar(value="115200")
+        self.device_var = tk.StringVar()
 
-        tk.Label(top, text="Port").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.port_combo = ttk.Combobox(top, textvariable=self.port_var, width=16, state="readonly")
-        self.port_combo.grid(row=0, column=1, padx=5, pady=5)
+        tk.Label(top, text="Device").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.device_combo = ttk.Combobox(top, textvariable=self.device_var, width=30, state="readonly")
+        self.device_combo.grid(row=0, column=1, padx=5, pady=5)
 
-        tk.Button(top, text="Refresh", command=self._refresh_ports).grid(row=0, column=2, padx=5, pady=5)
-
-        tk.Label(top, text="Baud").grid(row=0, column=3, sticky="w", padx=5, pady=5)
-        tk.Entry(top, textvariable=self.baud_var, width=10).grid(row=0, column=4, padx=5, pady=5)
-
-        tk.Button(top, text="Connect Stream", command=self._connect_stream).grid(row=0, column=5, padx=5, pady=5)
-        tk.Button(top, text="Disconnect", command=self._disconnect_stream).grid(row=0, column=6, padx=5, pady=5)
+        tk.Button(top, text="Scan", command=self._scan_ble).grid(row=0, column=2, padx=5, pady=5)
+        tk.Button(top, text="Connect Stream", command=self._connect_stream).grid(row=0, column=3, padx=5, pady=5)
+        tk.Button(top, text="Disconnect", command=self._disconnect_stream).grid(row=0, column=4, padx=5, pady=5)
 
         out = tk.LabelFrame(self.record_tab, text="Recording")
         out.pack(fill="x", padx=8, pady=8)
@@ -318,11 +312,27 @@ class PipelineGUI(tk.Tk):
         if changed:
             widget.see("end")
 
-    def _refresh_ports(self):
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        self.port_combo["values"] = ports
-        if ports and not self.port_var.get():
-            self.port_var.set(ports[0])
+    def _scan_ble(self):
+        self.record_status.set("Scanning for BLE devices...")
+        def run_scan():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            devices = loop.run_until_complete(BleakScanner.discover(timeout=3.0))
+            self.after(0, lambda: self._update_device_list(devices))
+        threading.Thread(target=run_scan, daemon=True).start()
+
+    def _update_device_list(self, devices):
+        names = []
+        self.device_addresses = {}
+        for d in devices:
+            name = d.name or "Unknown"
+            display = f"{name} ({d.address})"
+            names.append(display)
+            self.device_addresses[display] = d.address
+        self.device_combo["values"] = names
+        if names:
+            self.device_var.set(names[0])
+        self.record_status.set("Scan complete.")
 
     def _browse_record_dir(self):
         path = filedialog.askdirectory(initialdir=self.record_dir_var.get())
@@ -360,34 +370,30 @@ class PipelineGUI(tk.Tk):
             self.norm_header_var.set(path)
 
     def _connect_stream(self):
-        if self.serial_thread and self.serial_thread.is_alive():
-            messagebox.showinfo("Serial", "Stream already connected.")
+        if self.ble_thread and self.ble_thread.is_alive():
+            messagebox.showinfo("BLE", "Stream already connected.")
             return
 
-        port = self.port_var.get().strip()
-        if not port:
-            messagebox.showwarning("Serial", "Choose a serial port first.")
+        display = self.device_var.get().strip()
+        if not display or display not in self.device_addresses:
+            messagebox.showwarning("BLE", "Choose a valid BLE device first.")
             return
+            
+        address = self.device_addresses[display]
 
-        try:
-            baud = int(self.baud_var.get().strip())
-        except ValueError:
-            messagebox.showwarning("Serial", "Baud must be an integer.")
-            return
-
-        self.serial_thread = SerialStreamThread(port=port, baud=baud, sample_queue=self.sample_queue, error_queue=self.error_queue)
-        self.serial_thread.start()
-        self.record_status.set(f"Connected to {port} @ {baud}. Not recording.")
+        self.ble_thread = BleStreamThread(address=address, sample_queue=self.sample_queue, error_queue=self.error_queue)
+        self.ble_thread.start()
+        self.record_status.set(f"Connecting to {display}...")
 
     def _disconnect_stream(self):
-        if self.serial_thread:
-            self.serial_thread.stop()
-            self.serial_thread = None
+        if self.ble_thread:
+            self.ble_thread.stop()
+            self.ble_thread = None
         self.record_status.set("Disconnected. Not recording.")
 
     def _start_recording(self):
-        if not (self.serial_thread and self.serial_thread.is_alive()):
-            messagebox.showwarning("Record", "Connect serial stream first.")
+        if not (self.ble_thread and self.ble_thread.is_alive()):
+            messagebox.showwarning("Record", "Connect BLE stream first.")
             return
         self.recording = True
         self.record_rows = []
@@ -536,8 +542,8 @@ class PipelineGUI(tk.Tk):
         self.after(30, self._ui_pump)
 
     def destroy(self):
-        if self.serial_thread:
-            self.serial_thread.stop()
+        if self.ble_thread:
+            self.ble_thread.stop()
         self.train_runner.stop()
         self.deploy_runner.stop()
         super().destroy()

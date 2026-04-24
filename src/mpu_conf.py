@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-ESP32 MPU Mouse — Axis Calibration GUI
-Requirements: pip install pyserial
+ESP32 MPU Mouse — Axis Calibration GUI (BLE Version)
+Requirements: pip install bleak
 """
 
-import json, threading, time
+import json, threading, time, asyncio, struct
 import tkinter as tk
 from tkinter import ttk, messagebox
-import serial, serial.tools.list_ports
+from bleak import BleakClient, BleakScanner
 
 # ─────────────────────────────────────────────────────────────────────────────
 AXIS_NAMES  = ["Yaw (0)", "Pitch (1)", "Roll (2)"]
@@ -36,54 +36,96 @@ FONT_MONO  = ("Consolas", 9)
 FONT_TINY  = ("Consolas", 8)
 FONT_HEAD  = ("Segoe UI", 9, "bold")
 
+# BLE UUIDs
+RAW_DATA_CHAR_UUID = "abcd0001-5678-1234-5678-1234567890ab"
+GESTURE_CHAR_UUID  = "abcd0002-5678-1234-5678-1234567890ab"
+CONFIG_CHAR_UUID   = "abcd0004-5678-1234-5678-1234567890ab"
 
 # ─────────────────────────────────────────────────────────────────────────────
-class SerialThread(threading.Thread):
-    def __init__(self, port, baud, on_data, on_gesture, on_status):
+class BleConfigThread(threading.Thread):
+    def __init__(self, address, on_data, on_gesture, on_status):
         super().__init__(daemon=True)
-        self.port, self.baud = port, baud
-        self.on_data, self.on_gesture, self.on_status = on_data, on_gesture, on_status
-        self._stop = threading.Event()
-        self.ser = None
+        self.address = address
+        self.on_data = on_data
+        self.on_gesture = on_gesture
+        self.on_status = on_status
+        self._stop = asyncio.Event()
+        self.client = None
         self.connected = False
+        self._loop = None
+        self._write_queue = asyncio.Queue()
 
     def run(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._run_async())
+
+    async def _run_async(self):
+        def raw_data_handler(sender, data):
+            if len(data) == 19 and data[0] == 0x01:
+                # Unpack 9 int16s (little endian)
+                vals = struct.unpack("<9h", data[1:])
+                # We only need yaw, pitch, roll which are the last 3, scaled by 100
+                yaw, pitch, roll = vals[6] / 100.0, vals[7] / 100.0, vals[8] / 100.0
+                self.on_data([yaw, pitch, roll])
+
+        def gesture_handler(sender, data):
+            try:
+                msg = json.loads(data.decode(errors="ignore"))
+                self.on_gesture(msg)
+            except json.JSONDecodeError:
+                pass
+
+        def config_handler(sender, data):
+            try:
+                msg = json.loads(data.decode(errors="ignore"))
+                if "ack" in msg or "pong" in msg:
+                    self.on_status("ack" if "ack" in msg else "connected")
+            except json.JSONDecodeError:
+                pass
+
+        def on_disconnect(client):
+            self.connected = False
+            self.on_status("disconnected")
+            self._stop.set()
+
         try:
-            self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
-            time.sleep(1.5)
-            self.ser.write(b'{"ping":1}\n')
-            deadline = time.time() + 3
-            while time.time() < deadline:
-                line = self.ser.readline().decode(errors="ignore").strip()
-                if line == '{"pong":1}':
-                    self.connected = True
-                    self.on_status("connected")
-                    break
-            else:
-                self.on_status("no_response"); return
+            self.client = BleakClient(self.address, disconnected_callback=on_disconnect)
+            await self.client.connect()
+            self.connected = True
+            self.on_status("connected")
+
+            await self.client.start_notify(RAW_DATA_CHAR_UUID, raw_data_handler)
+            await self.client.start_notify(GESTURE_CHAR_UUID, gesture_handler)
+            await self.client.start_notify(CONFIG_CHAR_UUID, config_handler)
+
+            # Send ping
+            await self.client.write_gatt_char(CONFIG_CHAR_UUID, b'{"ping":1}')
+
             while not self._stop.is_set():
-                raw = self.ser.readline().decode(errors="ignore").strip()
-                if not raw: continue
                 try:
-                    msg = json.loads(raw)
-                    if "a" in msg:         self.on_data(msg["a"])
-                    elif "gesture" in msg: self.on_gesture(msg)
-                    elif "ack" in msg:     self.on_status("ack")
-                except json.JSONDecodeError:
+                    # Wait for items to write, timeout to check stop event
+                    payload = await asyncio.wait_for(self._write_queue.get(), timeout=0.1)
+                    await self.client.write_gatt_char(CONFIG_CHAR_UUID, (json.dumps(payload)).encode())
+                except asyncio.TimeoutError:
                     pass
-        except serial.SerialException as e:
+                except Exception as e:
+                    self.on_status(f"error:{e}")
+
+        except Exception as e:
             self.on_status(f"error:{e}")
         finally:
-            if self.ser and self.ser.is_open: self.ser.close()
+            if self.client and self.client.is_connected:
+                await self.client.disconnect()
             self.connected = False
 
     def send(self, payload):
-        if self.ser and self.ser.is_open:
-            self.ser.write((json.dumps(payload) + "\n").encode())
+        if self.connected and self._loop:
+            asyncio.run_coroutine_threadsafe(self._write_queue.put(payload), self._loop)
 
     def stop(self):
-        self._stop.set()
-
+        if self._loop:
+            self._loop.call_soon_threadsafe(self._stop.set)
 
 # ─────────────────────────────────────────────────────────────────────────────
 class PrecisionSlider(tk.Frame):
@@ -148,7 +190,6 @@ class PrecisionSlider(tk.Frame):
     def set(self, v):
         self._var.set(round(float(v), self._dec()))
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 class DeadzoneViz(tk.Canvas):
     W = H = 80
@@ -194,7 +235,6 @@ class DeadzoneViz(tk.Canvas):
                          fill=C["accent"] if not inside else C["text2"],
                          font=FONT_TINY)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 class AxisBar(tk.Canvas):
     W, H = 230, 18
@@ -233,7 +273,6 @@ class AxisBar(tk.Canvas):
         self.create_text(self.W-3, cy, text=f"{sign}{self._value:6.1f}°",
                          anchor="e", fill=C["text0"], font=FONT_MONO)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 class Card(tk.Frame):
     def __init__(self, parent, title, **kw):
@@ -247,7 +286,6 @@ class Card(tk.Frame):
         self.body = tk.Frame(self, bg=C["bg1"])
         self.body.pack(fill="both", expand=True, padx=10, pady=8)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 class App(tk.Tk):
     def __init__(self):
@@ -257,8 +295,9 @@ class App(tk.Tk):
         self.minsize(880, 620)
 
         self.cfg    = dict(DEFAULT_CFG)
-        self.serial = None
+        self.ble_thread = None
         self.axes   = [0.0, 0.0, 0.0]
+        self.device_addresses = {}
 
         self._load_config()
         self._setup_style()
@@ -293,13 +332,13 @@ class App(tk.Tk):
                  font=("Consolas", 11, "bold"), padx=14, pady=8).grid(row=0, column=0)
         tk.Frame(top, bg=C["border"], width=1).grid(row=0, column=1, sticky="ns", pady=4)
 
-        tk.Label(top, text="PORT", bg=C["bg0"], fg=C["text1"],
+        tk.Label(top, text="DEVICE", bg=C["bg0"], fg=C["text1"],
                  font=FONT_TINY, padx=8).grid(row=0, column=2)
-        self.port_var = tk.StringVar()
-        self.port_cb  = ttk.Combobox(top, textvariable=self.port_var,
-                                     width=13, state="readonly")
-        self.port_cb.grid(row=0, column=3, padx=(0, 4))
-        self._btn(top, "⟳", self._refresh_ports).grid(row=0, column=4, sticky="w", padx=2)
+        self.device_var = tk.StringVar()
+        self.device_cb  = ttk.Combobox(top, textvariable=self.device_var,
+                                       width=25, state="readonly")
+        self.device_cb.grid(row=0, column=3, padx=(0, 4))
+        self._btn(top, "SCAN", self._scan_ble).grid(row=0, column=4, sticky="w", padx=2)
         self._btn(top, "CONNECT", self._connect, accent=True).grid(
             row=0, column=5, padx=6)
 
@@ -310,7 +349,6 @@ class App(tk.Tk):
         self.status_lbl = tk.Label(top, text="DISCONNECTED", bg=C["bg0"],
                                    fg=C["red"], font=("Consolas", 8, "bold"), padx=8)
         self.status_lbl.grid(row=0, column=7, sticky="e")
-        self._refresh_ports()
 
         # Body
         body = tk.Frame(self, bg=C["bg0"])
@@ -550,7 +588,7 @@ class App(tk.Tk):
         for k, sl in self.gain_sliders.items(): self.cfg[k] = sl.get()
         for k, sl in self.thresh_sliders.items(): self.cfg[k] = sl.get()
 
-    # ── Serial callbacks ──────────────────────────────────────────────────────
+    # ── BLE callbacks ──────────────────────────────────────────────────────
     def _on_data(self, axes):     self.axes = axes
     def _on_gesture(self, msg):   self.after(0, lambda: self._log_gesture(msg))
     def _on_status(self, code):   self.after(0, lambda: self._set_status(code))
@@ -579,30 +617,51 @@ class App(tk.Tk):
         self.gesture_log.configure(state="disabled")
 
     # ── Actions ───────────────────────────────────────────────────────────────
-    def _refresh_ports(self):
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        self.port_cb["values"] = ports
-        if ports and not self.port_var.get(): self.port_var.set(ports[0])
+    def _scan_ble(self):
+        self._set_status("scanning")
+        def run_scan():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            devices = loop.run_until_complete(BleakScanner.discover(timeout=3.0))
+            self.after(0, lambda: self._update_device_list(devices))
+        threading.Thread(target=run_scan, daemon=True).start()
+
+    def _update_device_list(self, devices):
+        names = []
+        self.device_addresses = {}
+        for d in devices:
+            name = d.name or "Unknown"
+            display = f"{name} ({d.address})"
+            names.append(display)
+            self.device_addresses[display] = d.address
+        self.device_cb["values"] = names
+        if names:
+            self.device_var.set(names[0])
+        self._set_status("disconnected")
 
     def _connect(self):
-        port = self.port_var.get()
-        if not port: messagebox.showwarning("No port", "Select a serial port first."); return
-        if self.serial: self.serial.stop()
+        display = self.device_var.get()
+        if not display or display not in self.device_addresses:
+            messagebox.showwarning("No device", "Scan and select a BLE device first.")
+            return
+        address = self.device_addresses[display]
+        if self.ble_thread: self.ble_thread.stop()
         self._set_status("connecting")
-        self.serial = SerialThread(port, 115200,
-                                   self._on_data, self._on_gesture, self._on_status)
-        self.serial.start()
+        self.ble_thread = BleConfigThread(address, self._on_data, self._on_gesture, self._on_status)
+        self.ble_thread.start()
 
     def _apply(self):
         self._widgets_to_cfg()
-        if self.serial and self.serial.connected:
-            self.serial.send({"cfg": self.cfg})
+        if self.ble_thread and self.ble_thread.connected:
+            self.ble_thread.send({"cfg": self.cfg})
         else:
             messagebox.showinfo("Not connected", "Connect to ESP32 first.")
 
     def _save_config(self):
         self._widgets_to_cfg()
         with open(SAVE_FILE, "w") as f: json.dump(self.cfg, f, indent=2)
+        if self.ble_thread and self.ble_thread.connected:
+            self.ble_thread.send({"save": 1})
         self._set_status("ack")
 
     def _load_config(self):
@@ -612,8 +671,7 @@ class App(tk.Tk):
         if "tiltThreshDeg" not in self.cfg and "clickThreshDeg" in self.cfg:
             self.cfg["tiltThreshDeg"] = self.cfg["clickThreshDeg"]
         self.cfg.pop("clickThreshDeg", None)
-        for k in ["shortcutFlick", "shortcutShake", "shortcutDoubleTilt", "shortcutCircle"]:
-            self.cfg[k] = normalize_shortcut(self.cfg.get(k, DEFAULT_CFG[k]))
+        # remove normalization of shortcuts since it was undefined anyway
 
     def _load_and_apply(self):
         self._load_config(); self._apply_cfg_to_widgets(); self._apply()
@@ -622,9 +680,8 @@ class App(tk.Tk):
         self.cfg = dict(DEFAULT_CFG); self._apply_cfg_to_widgets(); self._apply()
 
     def _on_close(self):
-        if self.serial: self.serial.stop()
+        if self.ble_thread: self.ble_thread.stop()
         self.destroy()
-
 
 if __name__ == "__main__":
     App().mainloop()

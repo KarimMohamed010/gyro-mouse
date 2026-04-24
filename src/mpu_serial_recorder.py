@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Serial dataset recorder for ESP32 + MPU6050 streams.
+BLE dataset recorder for ESP32 + MPU6050 streams.
 
-Expected serial sample format per line:
-    ax,ay,az,gx,gy,gz,yaw,pitch,roll
+Expected BLE payload format per frame:
+    [0x01][ax][ay][az][gx][gy][gz][yaw*100][pitch*100][roll*100]
 
 Controls:
     1=swipe, 2=shake, 3=circle, 4=wave, 5=idle
@@ -21,14 +21,15 @@ import queue
 import sys
 import threading
 import time
+import asyncio
+import struct
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import serial
-import serial.tools.list_ports
+from bleak import BleakClient, BleakScanner
 
 FEATURE_NAMES = ["ax", "ay", "az", "gx", "gy", "gz", "yaw", "pitch", "roll"]
 EXPECTED_FEATURE_COUNT = 9
@@ -40,6 +41,8 @@ LABEL_KEYS = {
     "5": "idle",
 }
 
+# BLE UUIDs
+RAW_DATA_CHAR_UUID = "abcd0001-5678-1234-5678-1234567890ab"
 
 @dataclass
 class Sample:
@@ -47,73 +50,84 @@ class Sample:
     values: list[float]
 
 
-def parse_sample_line(line: str) -> Optional[list[float]]:
-    """Return 9 float features if line is valid, otherwise None."""
-    cleaned = line.strip()
-    if not cleaned:
-        return None
-
-    # Ignore obvious non-sample lines (status text / JSON / garbage).
-    if cleaned.startswith("{") or cleaned.startswith("["):
-        return None
-
-    parts = [p.strip() for p in cleaned.split(",")]
-    if len(parts) != EXPECTED_FEATURE_COUNT:
-        return None
-
-    try:
-        values = [float(p) for p in parts]
-    except ValueError:
-        return None
-
-    if any(not math.isfinite(v) for v in values):
-        return None
-
-    return values
-
-
-class SerialReader(threading.Thread):
-    def __init__(self, port: str, baud: int, out_queue: queue.Queue[Sample]):
+class BleStreamReader(threading.Thread):
+    def __init__(self, device_name: str, out_queue: queue.Queue[Sample]):
         super().__init__(daemon=True)
-        self.port = port
-        self.baud = baud
+        self.device_name = device_name
         self.out_queue = out_queue
-        self.stop_event = threading.Event()
+        self.stop_event = asyncio.Event()
         self.error: Optional[str] = None
         self.valid_count = 0
         self.invalid_count = 0
 
     def run(self) -> None:
-        try:
-            with serial.Serial(self.port, self.baud, timeout=0.05) as ser:
-                while not self.stop_event.is_set():
-                    raw = ser.readline()
-                    if not raw:
-                        continue
-                    line = raw.decode("utf-8", errors="ignore")
-                    values = parse_sample_line(line)
-                    if values is None:
-                        self.invalid_count += 1
-                        continue
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._run_async())
 
+    async def _run_async(self):
+        try:
+            print(f"Scanning for device containing '{self.device_name}'...")
+            devices = await BleakScanner.discover(timeout=5.0)
+            target_device = None
+            for d in devices:
+                if d.name and self.device_name.lower() in d.name.lower():
+                    target_device = d
+                    break
+
+            if not target_device:
+                self.error = f"Device '{self.device_name}' not found."
+                return
+
+            print(f"Connecting to {target_device.name} ({target_device.address})...")
+
+            def raw_data_handler(sender, data):
+                if len(data) == 19 and data[0] == 0x01:
+                    vals = struct.unpack("<9h", data[1:])
+                    # Accel/Gyro are raw. Yaw/Pitch/Roll were multiplied by 100
+                    values = [
+                        float(vals[0]), float(vals[1]), float(vals[2]),
+                        float(vals[3]), float(vals[4]), float(vals[5]),
+                        vals[6] / 100.0, vals[7] / 100.0, vals[8] / 100.0
+                    ]
+                    
                     self.valid_count += 1
                     sample = Sample(timestamp=time.time(), values=values)
                     try:
                         self.out_queue.put_nowait(sample)
                     except queue.Full:
-                        # Drop oldest one to keep the stream fresh.
                         try:
                             self.out_queue.get_nowait()
                         except queue.Empty:
                             pass
                         self.out_queue.put_nowait(sample)
-        except serial.SerialException as exc:
-            self.error = f"Serial error: {exc}"
-        except Exception as exc:  # Defensive guard for production use.
-            self.error = f"Unexpected reader error: {exc}"
+                else:
+                    self.invalid_count += 1
+
+            def on_disconnect(client):
+                self.error = "BLE disconnected unexpectedly."
+                self.stop_event.set()
+
+            async with BleakClient(target_device.address, disconnected_callback=on_disconnect) as client:
+                print("Connected! Subscribing to raw data characteristic...")
+                await client.start_notify(RAW_DATA_CHAR_UUID, raw_data_handler)
+                
+                # Wait until stopped
+                await self.stop_event.wait()
+                
+                if client.is_connected:
+                    await client.stop_notify(RAW_DATA_CHAR_UUID)
+
+        except Exception as exc:
+            self.error = f"BLE error: {exc}"
 
     def stop(self) -> None:
-        self.stop_event.set()
+        def set_stop():
+            self.stop_event.set()
+        
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.call_soon_threadsafe(set_stop)
 
 
 class KeyReader:
@@ -237,18 +251,6 @@ class LivePlotter:
         self._plt.close(self.fig)
 
 
-def choose_port(explicit_port: Optional[str]) -> str:
-    if explicit_port:
-        return explicit_port
-
-    ports = [p.device for p in serial.tools.list_ports.comports()]
-    if not ports:
-        raise RuntimeError("No serial ports found. Pass --port explicitly.")
-
-    print(f"Auto-selected serial port: {ports[0]}")
-    return ports[0]
-
-
 def write_recording(out_dir: Path, index: int, rows: list[list[object]]) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -272,34 +274,17 @@ def print_controls() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Record MPU6050 serial samples to labeled CSV files.")
-    parser.add_argument("--port", help="Serial port (e.g., COM5). Auto-detected if omitted.")
-    parser.add_argument("--baud", type=int, default=115200, help="Serial baud rate (default: 115200).")
+    parser = argparse.ArgumentParser(description="Record MPU6050 BLE samples to labeled CSV files.")
+    parser.add_argument("--device", default="ESP32 MPU Mouse", help="BLE Device name (or partial name) to connect to.")
     parser.add_argument("--out", default="recordings", help="Output directory for CSV files.")
     parser.add_argument("--target-hz", type=float, default=50.0, help="Approximate saved sample rate.")
     parser.add_argument("--plot", action="store_true", help="Enable optional live plotting.")
     parser.add_argument("--plot-history", type=float, default=10.0, help="Live plot history window in seconds.")
-    parser.add_argument("--list-ports", action="store_true", help="List serial ports and exit.")
     args = parser.parse_args()
-
-    if args.list_ports:
-        ports = list(serial.tools.list_ports.comports())
-        if not ports:
-            print("No serial ports found.")
-            return 0
-        for p in ports:
-            print(f"{p.device} - {p.description}")
-        return 0
-
-    try:
-        port = choose_port(args.port)
-    except RuntimeError as exc:
-        print(exc)
-        return 1
 
     out_dir = Path(args.out)
     sample_queue: queue.Queue[Sample] = queue.Queue(maxsize=4096)
-    reader = SerialReader(port=port, baud=args.baud, out_queue=sample_queue)
+    reader = BleStreamReader(device_name=args.device, out_queue=sample_queue)
 
     plotter = None
     if args.plot:
@@ -308,7 +293,6 @@ def main() -> int:
         except Exception as exc:
             print(f"Live plotting disabled ({exc}). Install matplotlib to enable --plot.")
 
-    print(f"Listening on {port} @ {args.baud} baud")
     print_controls()
 
     current_label = "idle"
@@ -348,7 +332,7 @@ def main() -> int:
                         print("Quit requested")
                         break
 
-                # Drain queue quickly each loop to keep up with serial data.
+                # Drain queue quickly each loop to keep up with BLE data.
                 for _ in range(256):
                     try:
                         sample = sample_queue.get_nowait()
