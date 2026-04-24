@@ -211,7 +211,7 @@ def _detect_system_languages() -> List[str]:
     return result
 
 
-_SYSTEM_LANGUAGES: List[str] = _detect_system_languages()
+_SYSTEM_LANGUAGES: List[str] = ["en", "ar"]
 
 _RTL_LANGUAGES = {"ar", "he", "fa", "ur"}
 
@@ -447,7 +447,7 @@ class ClipboardHistory(QObject):
 # ═══════════════════════════════════════════════════════════════════════════
 _LAYOUT_LETTERS: Dict[str, List[List[str]]] = {
     "en": [
-        list("qwertyuiop"),
+        list("Awertyuiop"),
         list("asdfghjkl"),
         ["Shift", "z","x","c","v","b","n","m", "Backspace"],
         ["Sym", "Lang", "Emoji", "Space", ".", ",", "Enter"],
