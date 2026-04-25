@@ -4,15 +4,16 @@ ESP32 MPU Mouse — Axis Calibration GUI
 Requirements: pip install pyserial
 """
 
-import json, threading, time
+import json, pathlib, threading, time
 import tkinter as tk
 from tkinter import ttk, messagebox
 import serial, serial.tools.list_ports
 
 # ─────────────────────────────────────────────────────────────────────────────
 AXIS_NAMES  = ["Yaw (0)", "Pitch (1)", "Roll (2)"]
-SAVE_FILE   = "mpu_config.json"
-OVERLAY_FILE = "overlay_config.json"
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+SAVE_FILE   = BASE_DIR / "mpu_config.json"
+OVERLAY_FILE = BASE_DIR / "overlay_config.json"
 
 OVERLAY_KEYS = {
     "scrollSpeed", "overlayIconRadius", "dwellTime",
@@ -315,10 +316,15 @@ class App(tk.Tk):
 
     # ── Build ─────────────────────────────────────────────────────────────────
     def _build_ui(self):
+        layout = tk.Frame(self, bg=C["bg0"])
+        layout.pack(fill="both", expand=True)
+        layout.columnconfigure(0, weight=1)
+        layout.rowconfigure(1, weight=1)
+
         # Top bar
-        top = tk.Frame(self, bg=C["bg0"],
+        top = tk.Frame(layout, bg=C["bg0"],
                        highlightthickness=1, highlightbackground=C["border"])
-        top.pack(fill="x")
+        top.grid(row=0, column=0, sticky="ew")
         top.columnconfigure(4, weight=1)
 
         tk.Label(top, text="MPU MOUSE  CONFIG",
@@ -345,9 +351,23 @@ class App(tk.Tk):
         self.status_lbl.grid(row=0, column=7, sticky="e")
         self._refresh_ports()
 
+        # Bottom action bar pinned to the last grid row.
+        bot = tk.Frame(layout, bg=C["bg0"],
+                       highlightthickness=1, highlightbackground=C["border"])
+        bot.grid(row=2, column=0, sticky="ew")
+        inner = tk.Frame(bot, bg=C["bg0"])
+        inner.pack(side="right", padx=10, pady=6)
+        for text, cmd, acc in [
+            ("APPLY",           self._apply,         True),
+            ("SAVE",            self._save_config,   False),
+            ("RESET",           self._reset_defaults,False),
+            ("CLOSE",           self._on_close,      False),
+        ]:
+            self._btn(inner, text, cmd, accent=acc).pack(side="left", padx=3)
+
         # ── Notebook (tabs) ───────────────────────────────────────────────
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
+        self.notebook = ttk.Notebook(layout)
+        self.notebook.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
 
         # ── Tab 1: MPU Config (existing layout, unchanged) ────────────────
         mpu_tab = tk.Frame(self.notebook, bg=C["bg0"])
@@ -388,20 +408,6 @@ class App(tk.Tk):
         overlay_tab = tk.Frame(self.notebook, bg=C["bg0"])
         self.notebook.add(overlay_tab, text="  Overlay Config  ")
         self._build_overlay_tab(overlay_tab)
-
-        # Bottom bar
-        bot = tk.Frame(self, bg=C["bg0"],
-                       highlightthickness=1, highlightbackground=C["border"])
-        bot.pack(fill="x")
-        inner = tk.Frame(bot, bg=C["bg0"])
-        inner.pack(side="right", padx=10, pady=6)
-        for text, cmd, acc in [
-            ("APPLY",           self._apply,         True),
-            ("SAVE",            self._save_config,   False),
-            ("RESET",           self._reset_defaults,False),
-            ("CLOSE",           self._on_close,      False),
-        ]:
-            self._btn(inner, text, cmd, accent=acc).pack(side="left", padx=3)
 
     # ── Section builders ──────────────────────────────────────────────────────
     def _build_mapping(self, p):
@@ -544,6 +550,10 @@ class App(tk.Tk):
         parent.rowconfigure(0, weight=1)
         parent.rowconfigure(1, weight=0)
 
+        # Detect actual screen resolution for accurate coordinate mapping
+        self._SCREEN_W = self.winfo_screenwidth()
+        self._SCREEN_H = self.winfo_screenheight()
+
         self.overlay_sliders = {}
 
         # Left column
@@ -620,18 +630,45 @@ class App(tk.Tk):
         pp = card_pos.body
         pp.rowconfigure(1, weight=1)
         pp.columnconfigure(0, weight=1)
-        tk.Label(pp, text="Drag icons to set position. All positions\\n"
-                          "are manual. Defaults only apply on first run.",
+        tk.Label(pp, text="Drag icons directly on the mini-screen.\\n"
+                  "Coordinates map to your real display resolution.",
                  bg=C["bg1"], fg=C["text2"], font=FONT_TINY,
                  justify="left").pack(anchor="w", pady=(0,4))
+        # Resolution override row
+        res_row = tk.Frame(pp, bg=C["bg1"])
+        res_row.pack(fill="x", pady=(0, 4))
+        tk.Label(res_row, text="Screen W:", bg=C["bg1"], fg=C["text1"],
+                 font=FONT_TINY).pack(side="left")
+        self._res_w_var = tk.IntVar(value=self._SCREEN_W)
+        self._res_w_spinbox = tk.Spinbox(res_row, from_=640, to=7680, increment=1,
+                   textvariable=self._res_w_var, width=6,
+                   bg=C["bg3"], fg=C["text0"], relief="flat",
+                   font=FONT_MONO, insertbackground=C["accent"],
+                   buttonbackground=C["bg2"],
+                   command=self._on_res_change)
+        self._res_w_spinbox.pack(side="left", padx=(2,8))
+        self._res_w_spinbox.bind("<Return>", lambda e: self._on_res_change())
+        self._res_w_spinbox.bind("<FocusOut>", lambda e: self._on_res_change())
+        tk.Label(res_row, text="H:", bg=C["bg1"], fg=C["text1"],
+                 font=FONT_TINY).pack(side="left")
+        self._res_h_var = tk.IntVar(value=self._SCREEN_H)
+        self._res_h_spinbox = tk.Spinbox(res_row, from_=480, to=4320, increment=1,
+                   textvariable=self._res_h_var, width=6,
+                   bg=C["bg3"], fg=C["text0"], relief="flat",
+                   font=FONT_MONO, insertbackground=C["accent"],
+                   buttonbackground=C["bg2"],
+                   command=self._on_res_change)
+        self._res_h_spinbox.pack(side="left", padx=(2,8))
+        self._res_h_spinbox.bind("<Return>", lambda e: self._on_res_change())
+        self._res_h_spinbox.bind("<FocusOut>", lambda e: self._on_res_change())
+
         self._pos_canvas = tk.Canvas(pp, bg="#0a0c10",
                                      highlightthickness=1,
                                      highlightbackground=C["border"])
         self._pos_canvas.pack(fill="both", expand=True, pady=(4,4))
 
-        self._SCREEN_W = 1920
-        self._SCREEN_H = 1080
         self._drag_icon = None
+        self._drag_offset = (0, 0)
         self._icon_dots = {}
         self._pos_canvas.bind("<Configure>", lambda e: self._redraw_pos_canvas())
         self._pos_canvas.bind("<Button-1>",  self._on_pos_drag_start)
@@ -697,27 +734,29 @@ class App(tk.Tk):
         c.create_text(cx, cy + r + 14, text=f"r = {int(round(self._preview_target_r))} px",
                       fill=C["text1"], font=FONT_TINY)
 
-    def _get_region_bounds(self, name, sw, sh):
-        LEFT_ICONS = {"rc", "drag", "kb", "copy", "paste"}
-        if name in LEFT_ICONS:
-            return 0, sw * 0.4, 0, sh
-        else:
-            return sw * 0.6, sw, 0, sh
-            
-    def _map_to_canvas(self, name, ix, iy, sx, sy, sw, sh):
-        x_min, x_max, y_min, y_max = self._get_region_bounds(name, sw, sh)
-        px = sx + x_min + (ix / self._SCREEN_W) * (x_max - x_min)
-        py = sy + y_min + (iy / self._SCREEN_H) * (y_max - y_min)
+    def _on_res_change(self):
+        """Called when the user edits the resolution spinboxes."""
+        try:
+            w = int(self._res_w_var.get())
+            h = int(self._res_h_var.get())
+            if w >= 640 and h >= 480:
+                self._SCREEN_W = w
+                self._SCREEN_H = h
+                self._redraw_pos_canvas()
+        except (tk.TclError, ValueError):
+            pass
+
+    def _map_to_canvas(self, ix, iy, sx, sy, sw, sh):
+        px = sx + (ix / self._SCREEN_W) * sw
+        py = sy + (iy / self._SCREEN_H) * sh
         return int(px), int(py)
-        
-    def _map_from_canvas(self, name, cx, cy, sx, sy, sw, sh):
-        x_min, x_max, y_min, y_max = self._get_region_bounds(name, sw, sh)
-        lx = cx - sx
-        ly = cy - sy
-        px = max(x_min, min(x_max, lx))
-        py = max(y_min, min(y_max, ly))
-        ix = ((px - x_min) / (x_max - x_min)) * self._SCREEN_W
-        iy = ((py - y_min) / (y_max - y_min)) * self._SCREEN_H
+
+    def _map_from_canvas(self, cx, cy, sx, sy, sw, sh):
+        """Convert canvas pixel position to screen coordinates, clamped to [0, screen size]."""
+        lx = max(0, min(sw, cx - sx))
+        ly = max(0, min(sh, cy - sy))
+        ix = round((lx / sw) * self._SCREEN_W)
+        iy = round((ly / sh) * self._SCREEN_H)
         return int(ix), int(iy)
 
     def _redraw_pos_canvas(self):
@@ -729,11 +768,24 @@ class App(tk.Tk):
         m = 8
         sx, sy, sw, sh = m, m, cw - m*2, ch - m*2
         c.create_rectangle(sx, sy, sx+sw, sy+sh, outline=C["border2"], fill="#0e1018", width=1)
-        
-        # Draw regions
-        c.create_rectangle(sx, sy, sx + sw * 0.4, sy + sh, fill=C["bg1"], outline=C["border"])
-        c.create_rectangle(sx + sw * 0.6, sy, sx + sw, sy + sh, fill=C["bg1"], outline=C["border"])
-        c.create_text(sx + sw * 0.5, sy + sh * 0.5, text="SCREEN\nGAP", fill=C["text2"], font=("Consolas", 10), justify="center")
+
+        # Draw mini-screen grid for easier positioning.
+        vx1 = sx + int(sw * 0.25)
+        vx2 = sx + int(sw * 0.50)
+        vx3 = sx + int(sw * 0.75)
+        hy1 = sy + int(sh * 0.25)
+        hy2 = sy + int(sh * 0.50)
+        hy3 = sy + int(sh * 0.75)
+        for x in (vx1, vx2, vx3):
+            c.create_line(x, sy, x, sy + sh, fill=C["border"], dash=(2, 3))
+        for y in (hy1, hy2, hy3):
+            c.create_line(sx, y, sx + sw, y, fill=C["border"], dash=(2, 3))
+
+        c.create_text(
+            sx + 8, sy + 8,
+            text=f"{self._SCREEN_W} x {self._SCREEN_H}",
+            fill=C["text2"], font=FONT_TINY, anchor="nw"
+        )
         
         self._icon_dots = {}
         icons_to_draw = [
@@ -769,22 +821,23 @@ class App(tk.Tk):
                 
             ix = max(0, min(self._SCREEN_W, ix))
             iy = max(0, min(self._SCREEN_H, iy))
-            
-            x_min, x_max, y_min, y_max = self._get_region_bounds(name, sw, sh)
-            px = sx + x_min + (ix / self._SCREEN_W) * (x_max - x_min)
-            py = sy + y_min + (iy / self._SCREEN_H) * (y_max - y_min)
+
+            px, py = self._map_to_canvas(ix, iy, sx, sy, sw, sh)
             r = 8
             dot = c.create_oval(px-r, py-r, px+r, py+r, fill=color, outline="#ffffff", width=1, tags=(name,))
-            c.create_text(px+14, py, text=lbl, fill=C["text1"], font=("Consolas", 7), anchor="w", tags=(f"{name}_lbl",))
+            c.create_text(px+14, py, text=f"{lbl} ({ix},{iy})", fill=C["text1"], font=("Consolas", 7), anchor="w", tags=(f"{name}_lbl",))
             self._icon_dots[name] = dot
 
     def _on_pos_drag_start(self, event):
         c = self._pos_canvas
-        for item in c.find_overlapping(event.x-10, event.y-10, event.x+10, event.y+10):
+        for item in c.find_overlapping(event.x-12, event.y-12, event.x+12, event.y+12):
             tags = c.gettags(item)
             for name in ["rc", "drag", "kb", "copy", "paste", "main", "up", "down"]:
                 if name in tags:
                     self._drag_icon = name
+                    x1, y1, x2, y2 = c.coords(item)
+                    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                    self._drag_offset = (event.x - cx, event.y - cy)
                     return
         self._drag_icon = None
 
@@ -794,18 +847,40 @@ class App(tk.Tk):
         m = 8
         cw, ch = c.winfo_width(), c.winfo_height()
         sx, sy, sw, sh = m, m, cw - m*2, ch - m*2
-        
-        x_min, x_max, y_min, y_max = self._get_region_bounds(self._drag_icon, sw, sh)
-        lx = event.x - sx
-        ly = event.y - sy
-        nx = sx + max(x_min, min(x_max, lx))
-        ny = sy + max(y_min, min(y_max, ly))
+
+        ox, oy = self._drag_offset
+        nx = max(sx, min(sx + sw, event.x - ox))
+        ny = max(sy, min(sy + sh, event.y - oy))
         dot = self._icon_dots.get(self._drag_icon)
         if dot:
             c.coords(dot, nx-8, ny-8, nx+8, ny+8)
             lbl = c.find_withtag(f"{self._drag_icon}_lbl")
             if lbl:
+                scr_x, scr_y = self._map_from_canvas(nx, ny, sx, sy, sw, sh)
+                label_text = c.itemcget(lbl[0], "text")
+                if " (" in label_text:
+                    base = label_text.split(" (", 1)[0]
+                else:
+                    base = label_text
                 c.coords(lbl[0], nx+14, ny)
+                c.itemconfigure(lbl[0], text=f"{base} ({scr_x},{scr_y})")
+
+            if self._drag_icon == "rc":
+                self.cfg["rcIconX"], self.cfg["rcIconY"] = self._map_from_canvas(nx, ny, sx, sy, sw, sh)
+            elif self._drag_icon == "drag":
+                self.cfg["dragIconX"], self.cfg["dragIconY"] = self._map_from_canvas(nx, ny, sx, sy, sw, sh)
+            elif self._drag_icon == "kb":
+                self.cfg["kbIconX"], self.cfg["kbIconY"] = self._map_from_canvas(nx, ny, sx, sy, sw, sh)
+            elif self._drag_icon == "copy":
+                self.cfg["copyIconX"], self.cfg["copyIconY"] = self._map_from_canvas(nx, ny, sx, sy, sw, sh)
+            elif self._drag_icon == "paste":
+                self.cfg["pasteIconX"], self.cfg["pasteIconY"] = self._map_from_canvas(nx, ny, sx, sy, sw, sh)
+            elif self._drag_icon == "main":
+                self.cfg["mainBtnX"], self.cfg["mainBtnY"] = self._map_from_canvas(nx, ny, sx, sy, sw, sh)
+            elif self._drag_icon == "up":
+                self.cfg["scrollUpX"], self.cfg["scrollUpY"] = self._map_from_canvas(nx, ny, sx, sy, sw, sh)
+            elif self._drag_icon == "down":
+                self.cfg["scrollDownX"], self.cfg["scrollDownY"] = self._map_from_canvas(nx, ny, sx, sy, sw, sh)
 
     def _on_pos_drag_end(self, event):
         if not self._drag_icon: return
@@ -813,9 +888,15 @@ class App(tk.Tk):
         m = 8
         cw, ch = c.winfo_width(), c.winfo_height()
         sx, sy, sw, sh = m, m, cw - m*2, ch - m*2
-        
-        scr_x, scr_y = self._map_from_canvas(self._drag_icon, event.x, event.y, sx, sy, sw, sh)
-        
+
+        # Use offset-corrected position (same as _on_pos_drag_move) so the
+        # final coordinate matches exactly where the dot was left, not where
+        # the raw mouse pointer is (which differs by the drag offset).
+        ox, oy = self._drag_offset
+        nx = max(sx, min(sx + sw, event.x - ox))
+        ny = max(sy, min(sy + sh, event.y - oy))
+        scr_x, scr_y = self._map_from_canvas(nx, ny, sx, sy, sw, sh)
+
         if self._drag_icon == "rc":
             self.cfg["rcIconX"], self.cfg["rcIconY"] = scr_x, scr_y
         elif self._drag_icon == "drag":
@@ -832,8 +913,9 @@ class App(tk.Tk):
             self.cfg["scrollUpX"], self.cfg["scrollUpY"] = scr_x, scr_y
         elif self._drag_icon == "down":
             self.cfg["scrollDownX"], self.cfg["scrollDownY"] = scr_x, scr_y
-            
+
         self._drag_icon = None
+        self._drag_offset = (0, 0)
     # ── Live loop ─────────────────────────────────────────────────────────────
     def _live_loop(self):
         dead_axis = {
@@ -945,6 +1027,11 @@ class App(tk.Tk):
         self._widgets_to_cfg()
         ov_out = {k: v for k, v in self.cfg.items() if k in OVERLAY_KEYS}
         try:
+            with open(OVERLAY_FILE, "w") as f:
+                json.dump(ov_out, f, indent=2)
+        except OSError:
+            pass
+        try:
             import socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.sendto(json.dumps(ov_out).encode('utf-8'), ("127.0.0.1", 55555))
@@ -976,7 +1063,9 @@ class App(tk.Tk):
         self._load_config(); self._apply_cfg_to_widgets(); self._apply()
 
     def _reset_defaults(self):
-        self.cfg = dict(DEFAULT_CFG); self._apply_cfg_to_widgets()
+        self.cfg = dict(DEFAULT_CFG)
+        self._apply_cfg_to_widgets()
+        self._apply()
 
     def _on_close(self):
         if self.serial: self.serial.stop()

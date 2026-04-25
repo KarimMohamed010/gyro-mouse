@@ -10,7 +10,7 @@
   "deadzoneClick": 2.0,
   "gainX": 0.3,
   "gainY": 0.3,
-  "tiltThreshDeg": 30.0,
+  "clickThreshDeg": 30.0,
   "flickVelThresh": 120.0,
   "flickReturnDeg": 8.0,
   "flickConfirmMs": 300.0,
@@ -20,5 +20,6 @@
   "enableFlick": true,
   "enableShake": true,
   "enableDoubleTilt": true,
-  "enableCircle": true
+  "enableCircle": true,
+  "tiltThreshDeg": 30.0
 }
