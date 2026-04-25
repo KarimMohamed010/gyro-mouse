@@ -5,3 +5,4 @@
 .vscode/ipch
 src/recordings/
 src/training_artifacts/
+.venv
