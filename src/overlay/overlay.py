@@ -56,12 +56,16 @@ Run:       python dwell_click_system.py
 """
 
 import ctypes
+import json
 import math
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
 import time
+import socket
+import threading
 from enum import Enum, auto
 
 from ctypes import wintypes
@@ -111,6 +115,62 @@ ACTION_BTN_R        = 19     # px
 BTN_GAP             = 10     # px
 RIGHT_PAD           = 4      # px panel from right edge
 LEFT_PAD            = 4      # px panel from left edge
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LIVE CONFIG LOADER  (reads mpu_config.json written by the Tkinter GUI)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CONFIG_PATH = pathlib.Path(__file__).resolve().parent.parent / "overlay_config.json"
+_cfg_cache   = {}     # last loaded values
+_cfg_mtime   = 0.0    # file modification time
+
+def load_overlay_config():
+    """Read overlay-relevant keys from the shared config file."""
+    global _cfg_cache, _cfg_mtime
+    try:
+        mt = _CONFIG_PATH.stat().st_mtime
+        if mt == _cfg_mtime:
+            return _cfg_cache
+        with open(_CONFIG_PATH) as f:
+            data = json.load(f)
+        _cfg_mtime = mt
+        _cfg_cache = {
+            "scrollSpeed":      int(data.get("scrollSpeed", SCROLL_SPEED_INIT)),
+            "overlayIconRadius": int(data.get("overlayIconRadius", ACTION_BTN_R)),
+            "dwellTime":        float(data.get("dwellTime", DWELL_EDGE)),
+            "rcIconX":          int(data.get("rcIconX", -1)),
+            "rcIconY":          int(data.get("rcIconY", -1)),
+            "dragIconX":        int(data.get("dragIconX", -1)),
+            "dragIconY":        int(data.get("dragIconY", -1)),
+            "kbIconX":          int(data.get("kbIconX", -1)),
+            "kbIconY":          int(data.get("kbIconY", -1)),
+            "copyIconX":        int(data.get("copyIconX", -1)),
+            "copyIconY":        int(data.get("copyIconY", -1)),
+            "pasteIconX":       int(data.get("pasteIconX", -1)),
+            "pasteIconY":       int(data.get("pasteIconY", -1)),
+            "mainBtnX":         int(data.get("mainBtnX", -1)),
+            "mainBtnY":         int(data.get("mainBtnY", -1)),
+            "scrollUpX":        int(data.get("scrollUpX", -1)),
+            "scrollUpY":        int(data.get("scrollUpY", -1)),
+            "scrollDownX":      int(data.get("scrollDownX", -1)),
+            "scrollDownY":      int(data.get("scrollDownY", -1)),
+        }
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        if not _cfg_cache:
+            _cfg_cache = {
+                "scrollSpeed":       SCROLL_SPEED_INIT,
+                "overlayIconRadius": ACTION_BTN_R,
+                "dwellTime":         DWELL_EDGE,
+                "rcIconX": -1, "rcIconY": -1,
+                "dragIconX": -1, "dragIconY": -1,
+                "kbIconX": -1, "kbIconY": -1,
+                "copyIconX": -1, "copyIconY": -1,
+                "pasteIconX": -1, "pasteIconY": -1,
+                "mainBtnX": -1, "mainBtnY": -1,
+                "scrollUpX": -1, "scrollUpY": -1,
+                "scrollDownX": -1, "scrollDownY": -1,
+            }
+    return _cfg_cache
 
 CURSOR_RING_R       = 26
 CURSOR_RING_W       = 3
@@ -171,7 +231,6 @@ class State(Enum):
     IDLE     = auto()
     ARMED_L  = auto()
     ARMED_R  = auto()
-    ARMED_DBL = auto()
     ARMED_DRAG = auto()
     CLICK    = auto()
     DRAGGING = auto()
@@ -273,8 +332,6 @@ def ring_color_for_state(state: State) -> QColor | None:
         return QColor(C_RING_L)
     if state == State.ARMED_R:
         return QColor(C_RING_R)
-    if state == State.ARMED_DBL:
-        return QColor(C_ACTION)
     if state in (State.ARMED_DRAG, State.DRAGGING):
         return QColor(C_DRAG_HELD)
     return None
@@ -635,19 +692,13 @@ class RightPanel(QWidget):
 
     def __init__(self):
         super().__init__()
-        mr = MAIN_BTN_R
-        sr = SCROLL_BTN_R
-        gap = BTN_GAP
-        pw  = (max(mr, sr) + sr + 20) * 2
-        ph  = mr * 2 + gap * 2 + sr * 2 + 32
-        self.setFixedSize(pw, ph)
+        cfg = load_overlay_config()
+        self._mr = MAIN_BTN_R
+        self._sr = SCROLL_BTN_R
 
-        self._cx   = pw / 2
-        self._cy   = ph / 2
-        self._su_y = self._cy - mr - gap - sr
-        self._sd_y = self._cy + mr + gap + sr
-        self._mr   = mr
-        self._sr   = sr
+        scr = QApplication.primaryScreen().geometry()
+        self.setFixedSize(scr.width(), scr.height())
+        self.move(scr.left(), scr.top())
 
         self._sys_state   = State.IDLE
         self._main_hover  = False
@@ -685,6 +736,7 @@ class RightPanel(QWidget):
         self._stimer = QTimer()
         self._stimer.setInterval(SCROLL_TICK_MS)
         self._stimer.timeout.connect(self._scroll_tick)
+        self._scroll_speed_init = cfg.get("scrollSpeed", SCROLL_SPEED_INIT)
 
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
@@ -692,15 +744,36 @@ class RightPanel(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self._place()
+        self._place(cfg)
 
-    def _place(self):
+    def _place(self, cfg):
         scr = QApplication.primaryScreen().geometry()
-        self.move(scr.right() - self.width() + RIGHT_PAD + self._sr + 4,
-                  scr.center().y() - self.height() // 2)
+        def_cx = scr.right() - RIGHT_PAD - self._sr - 4
+        def_cy = scr.center().y()
+        gap = BTN_GAP
+        mr = self._mr
+        sr = self._sr
+
+        mx = cfg.get("mainBtnX", -1); my = cfg.get("mainBtnY", -1)
+        ux = cfg.get("scrollUpX", -1); uy = cfg.get("scrollUpY", -1)
+        dx = cfg.get("scrollDownX", -1); dy = cfg.get("scrollDownY", -1)
+
+        if mx == -1 or my == -1: mx, my = def_cx, def_cy
+        if ux == -1 or uy == -1: ux, uy = mx, my - mr - gap - sr
+        if dx == -1 or dy == -1: dx, dy = mx, my + mr + gap + sr
+
+        self._cx, self._cy = mx, my
+        self._su_x, self._su_y = ux, uy
+        self._sd_x, self._sd_y = dx, dy
 
     def contains(self, x, y):
-        return self.geometry().contains(x, y)
+        pts = [(self._cx, self._cy, self._mr),
+               (self._su_x, self._su_y, self._sr),
+               (self._sd_x, self._sd_y, self._sr)]
+        for (px, py, pr) in pts:
+            if math.hypot(x - px, y - py) <= pr + 8:
+                return True
+        return False
 
     def set_state(self, s):
         self._sys_state = s
@@ -713,12 +786,8 @@ class RightPanel(QWidget):
         self._main_flash = 1.0
 
     def update_cursor(self, x, y):
-        geo = self.geometry()
-        lx, ly = x - geo.x(), y - geo.y()
-        cx, cy = self._cx, self._cy
-
         # Main
-        dm = math.hypot(lx - cx, ly - cy)
+        dm = math.hypot(x - self._cx, y - self._cy)
         wm = self._main_hover
         self._main_hover = dm < self._mr + 8
         if self._main_hover:
@@ -727,7 +796,7 @@ class RightPanel(QWidget):
             self._main_t.reset(); self._main_prog = 0.0; self.update()
 
         # Scroll up
-        du = math.hypot(lx - cx, ly - self._su_y)
+        du = math.hypot(x - self._su_x, y - self._su_y)
         wu = self._su_hover
         self._su_hover = du < self._sr + 8
         if self._su_hover:
@@ -737,7 +806,7 @@ class RightPanel(QWidget):
             self._stop_scroll(-1)
 
         # Scroll down
-        dd = math.hypot(lx - cx, ly - self._sd_y)
+        dd = math.hypot(x - self._sd_x, y - self._sd_y)
         wd = self._sd_hover
         self._sd_hover = dd < self._sr + 8
         if self._sd_hover:
@@ -797,11 +866,14 @@ class RightPanel(QWidget):
             self._stimer.stop(); self._scroll_held = 0.0
         self.update()
 
+    def set_scroll_speed(self, speed):
+        self._scroll_speed_init = max(1, min(10, int(speed)))
+
     def _scroll_tick(self):
         self._scroll_held += SCROLL_TICK_MS / 1000.0
         speed = min(
-            SCROLL_SPEED_INIT + int(
-                (self._scroll_held / SCROLL_ACCEL_TIME) * (SCROLL_SPEED_MAX - SCROLL_SPEED_INIT)
+            self._scroll_speed_init + int(
+                (self._scroll_held / SCROLL_ACCEL_TIME) * (SCROLL_SPEED_MAX - self._scroll_speed_init)
             ), SCROLL_SPEED_MAX
         )
         self.scroll_evt.emit(self._scroll_dir * speed)
@@ -813,10 +885,11 @@ class RightPanel(QWidget):
         mr, sr = float(self._mr), float(self._sr)
 
         # Safe zone hint
-        sh = QRectF(cx - mr - 2, self._su_y - sr - 4,
-                    (mr + 2) * 2, self._sd_y - self._su_y + sr * 2 + 8)
-        p.setBrush(QBrush(C_SAFE_PILL)); p.setPen(Qt.NoPen)
-        p.drawRoundedRect(sh, mr + 2, mr + 2)
+        for px, py, pr in [(cx, cy, mr),
+                           (self._su_x, self._su_y, sr),
+                           (self._sd_x, self._sd_y, sr)]:
+            p.setBrush(QBrush(C_SAFE_PILL)); p.setPen(Qt.NoPen)
+            p.drawEllipse(QPointF(px, py), pr + 2, pr + 2)
 
         # ── Main button ───────────────────────────────────────────────────
         s = self._sys_state
@@ -870,9 +943,9 @@ class RightPanel(QWidget):
         draw_ring(p, cx, cy, mr + 7, self._main_prog, ring_c, 2.3)
 
         # ── Scroll circles ────────────────────────────────────────────────
-        for (scy, active, held, hover, prog, dt_held) in [
-            (self._su_y, self._su_active, self._su_held, self._su_hover, self._su_prog, self._su_held),
-            (self._sd_y, self._sd_active, self._sd_held, self._sd_hover, self._sd_prog, self._sd_held),
+        for (scx, scy, active, held, hover, prog, dt_held) in [
+            (self._su_x, self._su_y, self._su_active, self._su_held, self._su_hover, self._su_prog, self._su_held),
+            (self._sd_x, self._sd_y, self._sd_active, self._sd_held, self._sd_hover, self._sd_prog, self._sd_held),
         ]:
             is_up = (scy == self._su_y)
             if active:
@@ -886,28 +959,34 @@ class RightPanel(QWidget):
             else:
                 sc = QColor(C_IDLE); sc.setAlpha(128 if hover else 88)
 
-            draw_dot(p, cx, scy, sr, sc)
+            draw_dot(p, scx, scy, sr, sc)
 
             ia2 = 198 if hover else 108
             p.setPen(QPen(QColor(255,255,255,ia2), 1.7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             p.setBrush(Qt.NoBrush)
             aw = 4.5
             if is_up:
-                pts = [QPointF(cx-aw, scy+3), QPointF(cx, scy-3), QPointF(cx+aw, scy+3)]
+                pts = [QPointF(scx-aw, scy+3), QPointF(scx, scy-3), QPointF(scx+aw, scy+3)]
             else:
-                pts = [QPointF(cx-aw, scy-3), QPointF(cx, scy+3), QPointF(cx+aw, scy-3)]
+                pts = [QPointF(scx-aw, scy-3), QPointF(scx, scy+3), QPointF(scx+aw, scy-3)]
             p.drawPolyline(pts)
 
             if not active:
-                draw_ring(p, cx, scy, sr+5, prog, C_SCROLL, 2.0)
+                draw_ring(p, scx, scy, sr+5, prog, C_SCROLL, 2.0)
             else:
                 angle = (time.monotonic() * 4) % (2 * math.pi)
                 dx_ = math.cos(angle) * (sr+5)
                 dy_ = math.sin(angle) * (sr+5)
                 p.setBrush(QBrush(sc)); p.setPen(Qt.NoPen)
-                p.drawEllipse(QPointF(cx+dx_, scy+dy_), 2.5, 2.5)
+                p.drawEllipse(QPointF(scx+dx_, scy+dy_), 2.5, 2.5)
 
         p.end()
+
+    def reload_config(self):
+        cfg = load_overlay_config()
+        self._scroll_speed_init = max(1, min(10, int(cfg.get("scrollSpeed", SCROLL_SPEED_INIT))))
+        self._place(cfg)
+        self.update()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -916,49 +995,48 @@ class RightPanel(QWidget):
 
 class LeftPanel(QWidget):
     """
-    Three buttons, always visible on left edge.
-    Double-click and drag arm on hover, then execute via cursor dwell.
+    Five freely positioned overlay action icons.
+    Double-click, drag, keyboard, copy, and paste.
     """
-    arm_double = Signal()
-    arm_drag   = Signal()
-    kb_toggle  = Signal()
+    double_click = Signal(float, float)
+    arm_drag     = Signal()
+    kb_toggle    = Signal()
+    copy_action  = Signal()
+    paste_action = Signal()
 
-    _BTN_DBL = 0
-    _BTN_DRG = 1
-    _BTN_KB  = 2
+    _BTN_DBL   = 0
+    _BTN_DRG   = 1
+    _BTN_KB    = 2
+    _BTN_COPY  = 3
+    _BTN_PASTE = 4
+    _NUM_BTNS  = 5
 
     def __init__(self):
         super().__init__()
-        ar   = ACTION_BTN_R
-        gap  = 12
-        step = ar * 2 + gap
-        pw   = ar * 2 + 28
-        ph   = ar * 6 + gap * 2 + 28
-        self.setFixedSize(pw, ph)
-        self._ar  = ar
+        cfg  = load_overlay_config()
+        self._ar   = cfg.get("overlayIconRadius", ACTION_BTN_R)
+        dwell = cfg.get("dwellTime", DWELL_EDGE)
 
-        self._cx   = pw / 2
-        self._bcy  = [
-            ph / 2 - step,
-            ph / 2,
-            ph / 2 + step,
-        ]
+        scr = QApplication.primaryScreen().geometry()
+        self.setFixedSize(scr.width(), scr.height())
+        self.move(scr.left(), scr.top())
 
-        self._drag_held = False
-        self._kb_open   = False
+        self._pts = [(20, 20)] * self._NUM_BTNS
+        self._load_pts(cfg)
+
+        self._drag_held  = False
+        self._kb_open    = False
         self._active_btn = None
         self._pulse      = 0.0
-        self._flash      = [0.0, 0.0, 0.0]
+        self._flash      = [0.0] * self._NUM_BTNS
 
-        self._hover = [False, False, False]
-        self._prog  = [0.0,   0.0,   0.0]
+        self._hover = [False] * self._NUM_BTNS
+        self._prog  = [0.0]  * self._NUM_BTNS
 
-        self._trackers = [
-            DwellTracker(DWELL_EDGE),
-            DwellTracker(DWELL_EDGE),
-            DwellTracker(DWELL_EDGE),
-        ]
-        self._trackers[0].complete.connect(lambda x,y: self.arm_double.emit())
+        self._trackers = [DwellTracker(dwell) for _ in range(self._NUM_BTNS)]
+
+        # Wire signals
+        self._trackers[0].complete.connect(lambda x,y: self.double_click.emit(x, y))
         self._trackers[0].progress.connect(lambda v: self._set_prog(0, v))
         self._trackers[0].cancelled.connect(lambda: self._set_prog(0, 0))
 
@@ -970,18 +1048,36 @@ class LeftPanel(QWidget):
         self._trackers[2].progress.connect(lambda v: self._set_prog(2, v))
         self._trackers[2].cancelled.connect(lambda: self._set_prog(2, 0))
 
+        self._trackers[3].complete.connect(lambda x,y: self.copy_action.emit())
+        self._trackers[3].progress.connect(lambda v: self._set_prog(3, v))
+        self._trackers[3].cancelled.connect(lambda: self._set_prog(3, 0))
+
+        self._trackers[4].complete.connect(lambda x,y: self.paste_action.emit())
+        self._trackers[4].progress.connect(lambda v: self._set_prog(4, v))
+        self._trackers[4].cancelled.connect(lambda: self._set_prog(4, 0))
+
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
             Qt.Tool | Qt.WindowTransparentForInput
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self._place()
 
-    def _place(self):
-        scr = QApplication.primaryScreen().geometry()
-        self.move(scr.left() - LEFT_PAD,
-                  scr.center().y() - self.height() // 2)
+    def _load_pts(self, cfg):
+        def _get(xk, yk, def_y):
+            x = cfg.get(xk, 20)
+            y = cfg.get(yk, def_y)
+            if x == -1: x = 20
+            if y == -1: y = def_y
+            return x, y
+
+        self._pts = [
+            _get("rcIconX", "rcIconY", 300),
+            _get("dragIconX", "dragIconY", 380),
+            _get("kbIconX", "kbIconY", 460),
+            _get("copyIconX", "copyIconY", 540),
+            _get("pasteIconX", "pasteIconY", 620)
+        ]
 
     def _set_prog(self, i, v):
         self._prog[i] = v; self.update()
@@ -993,9 +1089,7 @@ class LeftPanel(QWidget):
         self._kb_open = open_; self.update()
 
     def set_state(self, state):
-        if state == State.ARMED_DBL:
-            active = self._BTN_DBL
-        elif state in (State.ARMED_DRAG, State.DRAGGING):
+        if state in (State.ARMED_DRAG, State.DRAGGING):
             active = self._BTN_DRG
         else:
             active = None
@@ -1005,19 +1099,22 @@ class LeftPanel(QWidget):
         self.update()
 
     def notify_click(self, idx):
-        self._flash[idx] = 1.0
+        if idx < len(self._flash):
+            self._flash[idx] = 1.0
         self.update()
 
     def contains(self, x, y):
-        return self.geometry().contains(x, y)
+        # We only claim the points within the radius so we don't trap everything
+        ar = self._ar
+        for (cx, cy) in self._pts:
+            if math.hypot(x - cx, y - cy) <= ar + 8:
+                return True
+        return False
 
     def update_cursor(self, x, y):
-        geo  = self.geometry()
-        lx   = x - geo.x()
-        ly   = y - geo.y()
         ar   = self._ar
-        for i, bcy in enumerate(self._bcy):
-            dist     = math.hypot(lx - self._cx, ly - bcy)
+        for i, (cx, cy) in enumerate(self._pts):
+            dist     = math.hypot(x - cx, y - cy)
             was      = self._hover[i]
             self._hover[i] = dist < ar + 8
             if self._hover[i]:
@@ -1035,42 +1132,96 @@ class LeftPanel(QWidget):
                 self._flash[i] = max(0.0, flash - delta * 5.0)
         self.update()
 
+    def reload_config(self):
+        cfg = load_overlay_config()
+        new_ar = cfg.get("overlayIconRadius", ACTION_BTN_R)
+        new_dwell = cfg.get("dwellTime", DWELL_EDGE)
+        changed = False
+        
+        if new_ar != self._ar:
+            self._ar = new_ar
+            changed = True
+            
+        old_pts = list(self._pts)
+        self._load_pts(cfg)
+        if old_pts != self._pts:
+            changed = True
+            
+        for t in self._trackers:
+            if t.dwell_time != new_dwell:
+                t.dwell_time = new_dwell
+                changed = True
+                
+        if changed:
+            self.update()
+
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
 
-        cx   = self._cx
         ar   = float(self._ar)
         font = QFont("Consolas", 8, QFont.Medium)
         p.setFont(font)
 
-        labels   = ["⧉", "↕", "⌨"]
-        colors   = [C_ACTION, C_DRAG_HELD if self._drag_held else C_ACTION, C_KB_BTN]
-        # Keyboard button glows when open
+        C_RC    = QColor(255, 171, 64, 182)    # amber for right click
+        C_DRAG  = QColor(179, 136, 255, 182)   # purple for drag
+        C_COPY  = QColor(58, 180, 220, 182)    # cyan for copy
+        C_PASTE = QColor(100, 210, 120, 182)   # green for paste
+
+        labels = ["⧉", "↕", "⌨", "📋", "📌"]
+        colors = [
+            C_RC,
+            C_DRAG_HELD if self._drag_held else C_DRAG,
+            C_KB_BTN,
+            C_COPY,
+            C_PASTE,
+        ]
         if self._kb_open:
             colors[2] = QColor(100, 200, 100, 210)
 
-        for i, bcy in enumerate(self._bcy):
+        for i, (cx, cy) in enumerate(self._pts):
+            hov   = self._hover[i]
             prog  = self._prog[i]
-            hover = self._hover[i]
-            active = (i == self._active_btn)
+            flash = self._flash[i]
+            col   = colors[i]
+            sr    = ar
 
-            bc = QColor(colors[i])
-            bc.setAlpha(210 if active else (172 if hover else 105))
-            draw_dot(p, cx, bcy, ar, bc)
+            if hov:
+                p.setBrush(QColor(40, 48, 60, 220))
+                p.setPen(QPen(col, 2))
+                sr = ar * 1.15
+            else:
+                p.setBrush(QColor(30, 36, 48, 180))
+                p.setPen(QPen(QColor(80, 90, 110), 1))
 
-            ia = 200 if (hover or active) else 120
-            p.setPen(QPen(QColor(255, 255, 255, ia)))
-            p.drawText(QRectF(cx - ar, bcy - ar, ar * 2, ar * 2), Qt.AlignCenter, labels[i])
+            if flash > 0:
+                sr = ar * (1.0 + 0.3 * flash)
+                bc = QColor(col)
+                bc.setAlpha(int(255 * flash))
+                p.setBrush(bc)
 
-            draw_ring(p, cx, bcy, ar + 6, prog, colors[i], 2.0)
+            p.drawEllipse(QPointF(cx, cy), sr, sr)
+
+            if prog > 0 and prog < 1.0:
+                p.setPen(QPen(col, 3, Qt.SolidLine, Qt.RoundCap))
+                p.setBrush(Qt.NoBrush)
+                span = int(-prog * 360 * 16)
+                p.drawArc(QRectF(cx - sr - 4, cy - sr - 4,
+                                 (sr + 4)*2, (sr + 4)*2),
+                          90 * 16, span)
+
+            tc = QColor(255, 255, 255) if hov else QColor(180, 190, 210)
+            p.setPen(tc)
+            p.drawText(QRectF(cx - sr, cy - sr, sr*2, sr*2),
+                       Qt.AlignCenter, labels[i])
+
+            if self._active_btn == i and flash == 0:
+                p.setPen(QPen(col, 1.5))
+                p.setBrush(Qt.NoBrush)
+                pulse_r = sr + 4 + math.sin(self._pulse) * 3
+                p.drawEllipse(QPointF(cx, cy), pulse_r, pulse_r)
 
         p.end()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CursorRing
-# ─────────────────────────────────────────────────────────────────────────────
 
 class CursorRing(QWidget):
     def __init__(self):
@@ -1158,7 +1309,6 @@ class CursorRing(QWidget):
             p.drawEllipse(QRectF(cx-fr, cy-fr, fr*2, fr*2))
         p.end()
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # MainController
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1195,9 +1345,11 @@ class MainController(QObject):
         self._right.disarm.connect(self._on_disarm)
         self._right.scroll_evt.connect(self._do_scroll)
 
-        self._left.arm_double.connect(self._on_arm_double)
+        self._left.double_click.connect(self._on_double_click)
         self._left.arm_drag.connect(self._on_arm_drag)
         self._left.kb_toggle.connect(self._on_kb_toggle)
+        self._left.copy_action.connect(self._on_copy)
+        self._left.paste_action.connect(self._on_paste)
 
         self._right.show()
         self._left.show()
@@ -1218,6 +1370,16 @@ class MainController(QObject):
 
         print("[DwellClick] Ready.")
 
+        # Config reload timer (every 2 s)
+        self._cfg_timer = QTimer()
+        self._cfg_timer.setInterval(2000)
+        self._cfg_timer.timeout.connect(self._reload_config)
+        self._cfg_timer.start()
+
+        self._udp = UdpConfigListener()
+        self._udp.config_received.connect(self._on_udp_config)
+        self._scroll_speed = load_overlay_config().get("scrollSpeed", SCROLL_SPEED_INIT)
+
     def _tick(self):
         now   = time.monotonic()
         delta = min(now - self._last_t, 0.05)
@@ -1225,7 +1387,7 @@ class MainController(QObject):
         x, y = QCursor.pos().x(), QCursor.pos().y()
 
         # Timeout
-        if self._state in (State.ARMED_L, State.ARMED_R, State.ARMED_DBL, State.ARMED_DRAG, State.DRAGGING):
+        if self._state in (State.ARMED_L, State.ARMED_R, State.ARMED_DRAG, State.DRAGGING):
             if self._armed_t and now - self._armed_t > ARMED_TIMEOUT:
                 if self._state == State.DRAGGING:
                     self._do_mouse_up()
@@ -1259,7 +1421,7 @@ class MainController(QObject):
                 if self._ring_mode == "keyboard":
                     self._ring.set_progress(0.0)
 
-            if self._state in (State.ARMED_L, State.ARMED_R, State.ARMED_DBL, State.ARMED_DRAG, State.DRAGGING):
+            if self._state in (State.ARMED_L, State.ARMED_R, State.ARMED_DRAG, State.DRAGGING):
                 self._sync_ring_mode("action")
                 self._ring.set_color(ring_color_for_state(self._state))
             else:
@@ -1269,7 +1431,7 @@ class MainController(QObject):
                 if self._dwell._dwell_t is not None:
                     self._dwell.reset()
                     self._ring.set_progress(0.0)
-            elif self._state in (State.ARMED_L, State.ARMED_R, State.ARMED_DBL, State.ARMED_DRAG, State.DRAGGING):
+            elif self._state in (State.ARMED_L, State.ARMED_R, State.ARMED_DRAG, State.DRAGGING):
                 self._dwell.update(x, y)
 
         self._ring.tick(delta)
@@ -1304,7 +1466,7 @@ class MainController(QObject):
         self._right.set_state(new)
         self._left.set_state(new)
 
-        if new in (State.ARMED_L, State.ARMED_R, State.ARMED_DBL, State.ARMED_DRAG):
+        if new in (State.ARMED_L, State.ARMED_R, State.ARMED_DRAG):
             self._armed_t = time.monotonic()
             self._dwell.reset()
             self._sync_ring_mode("action")
@@ -1345,13 +1507,9 @@ class MainController(QObject):
     def _on_disarm(self):
         self._set(State.IDLE)
 
-    def _on_arm_double(self):
-        if self._state == State.DRAGGING:
-            return
-        if self._state == State.ARMED_DBL:
-            self._set(State.IDLE)
-        else:
-            self._set(State.ARMED_DBL)
+    def _on_double_click(self, x, y):
+        self._left.notify_click(LeftPanel._BTN_DBL)
+        self._do_dbl_click(x, y)
 
     def _on_arm_drag(self):
         if self._state == State.DRAGGING:
@@ -1394,13 +1552,6 @@ class MainController(QObject):
             self._set(State.CLICK)
             self._right.notify_click()
             self._do_click(x, y, right=True)
-            QTimer.singleShot(int(CLICK_COOLDOWN * 1000), lambda: self._set(State.IDLE))
-            return
-
-        if self._state == State.ARMED_DBL:
-            self._set(State.CLICK)
-            self._left.notify_click(LeftPanel._BTN_DBL)
-            self._do_dbl_click(x, y)
             QTimer.singleShot(int(CLICK_COOLDOWN * 1000), lambda: self._set(State.IDLE))
             return
 
@@ -1498,6 +1649,66 @@ class MainController(QObject):
         try: self._mouse.scroll(0, -amount)
         except Exception as e: print(f"[DwellClick] scroll: {e}")
 
+    # ── Copy / Paste ──────────────────────────────────────────────────────
+    def _on_copy(self):
+        self._left.notify_click(LeftPanel._BTN_COPY)
+        if not PYNPUT_AVAILABLE:
+            print("[DwellClick] COPY [sim]"); return
+        try:
+            kb = KbController()
+            kb.press(Key.ctrl); kb.press('c')
+            kb.release('c'); kb.release(Key.ctrl)
+            print("[DwellClick] Ctrl+C fired")
+        except Exception as e:
+            print(f"[DwellClick] copy error: {e}")
+
+    def _on_paste(self):
+        self._left.notify_click(LeftPanel._BTN_PASTE)
+        if not PYNPUT_AVAILABLE:
+            print("[DwellClick] PASTE [sim]"); return
+        try:
+            kb = KbController()
+            kb.press(Key.ctrl); kb.press('v')
+            kb.release('v'); kb.release(Key.ctrl)
+            print("[DwellClick] Ctrl+V fired")
+        except Exception as e:
+            print(f"[DwellClick] paste error: {e}")
+
+    # ── Live config reload ────────────────────────────────────────────────
+    def _reload_config(self):
+        cfg = load_overlay_config()
+        self._right.reload_config()
+        self._left.reload_config()
+        
+    def _on_udp_config(self, cfg):
+        global _cfg_cache
+        _cfg_cache.update(cfg)
+        self._right.reload_config()
+        self._left.reload_config()
+
+class UdpConfigListener(QObject):
+    config_received = Signal(dict)
+    def __init__(self):
+        super().__init__()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 55555))
+        self.sock.settimeout(0.5)
+        self.thread = threading.Thread(target=self._listen, daemon=True)
+        self.thread.start()
+        
+    def _listen(self):
+        while True:
+            try:
+                data, _ = self.sock.recvfrom(4096)
+                if data:
+                    cfg = json.loads(data.decode('utf-8'))
+                    self.config_received.emit(cfg)
+            except socket.timeout:
+                pass
+            except Exception as e:
+                print(f"[UDP] Error: {e}")
+                time.sleep(1)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
@@ -1516,7 +1727,7 @@ def main():
     print("  │    [▼]  hover → scroll down (accelerates)             │")
     print("  │                                                       │")
     print("  │  LEFT EDGE  (safe zone, arms on one dwell)            │")
-    print("  │    [⧉]  dwell → arm double-click, dwell again fires   │")
+    print("  │    [⧉]  dwell → immediate double-click                │")
     print("  │    [↕]  dwell → arm drag, dwell = hold/release        │")
     print("  │    [⌨]  dwell → open system keyboard toggle           │")
     print("  │                                                       │")

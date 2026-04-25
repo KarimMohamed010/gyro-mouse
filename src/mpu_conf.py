@@ -12,6 +12,16 @@ import serial, serial.tools.list_ports
 # ─────────────────────────────────────────────────────────────────────────────
 AXIS_NAMES  = ["Yaw (0)", "Pitch (1)", "Roll (2)"]
 SAVE_FILE   = "mpu_config.json"
+OVERLAY_FILE = "overlay_config.json"
+
+OVERLAY_KEYS = {
+    "scrollSpeed", "overlayIconRadius", "dwellTime",
+    "rcIconX", "rcIconY", "dragIconX", "dragIconY",
+    "kbIconX", "kbIconY", "copyIconX", "copyIconY",
+    "pasteIconX", "pasteIconY",
+    "mainBtnX", "mainBtnY", "scrollUpX", "scrollUpY",
+    "scrollDownX", "scrollDownY"
+}
 
 DEFAULT_CFG = {
     "cursorXAxis": 0, "cursorYAxis": 2, "clickAxis": 1,
@@ -23,6 +33,18 @@ DEFAULT_CFG = {
     "shakeVelThresh": 60.0, "doubleTiltDeg": 25.0, "circleMinSpeed": 20.0,
     "enableFlick": True, "enableShake": True,
     "enableDoubleTilt": True, "enableCircle": True,
+    # Overlay settings
+    "scrollSpeed": 2,         # overlay scroll initial speed (1–10)
+    "overlayIconRadius": 19,  # overlay action-button radius px (10–40)
+    "dwellTime": 0.75,        # seconds to hover before action triggers
+    "rcIconX": -1, "rcIconY": -1,
+    "dragIconX": -1, "dragIconY": -1,
+    "kbIconX": -1, "kbIconY": -1,
+    "copyIconX": -1, "copyIconY": -1,
+    "pasteIconX": -1, "pasteIconY": -1,
+    "mainBtnX": -1, "mainBtnY": -1,
+    "scrollUpX": -1, "scrollUpY": -1,
+    "scrollDownX": -1, "scrollDownY": -1,
 }
 
 C = {
@@ -257,6 +279,7 @@ class App(tk.Tk):
         self.minsize(880, 620)
 
         self.cfg    = dict(DEFAULT_CFG)
+        self._saved_cfg = dict(self.cfg)
         self.serial = None
         self.axes   = [0.0, 0.0, 0.0]
 
@@ -279,6 +302,16 @@ class App(tk.Tk):
               foreground=[("readonly", C["text0"])])
         s.configure("Vert.TScrollbar", background=C["bg2"],
                     troughcolor=C["bg3"], arrowcolor=C["text1"], relief="flat")
+        # Notebook tab styling — dark theme
+        s.configure("TNotebook", background=C["bg0"], borderwidth=0)
+        s.configure("TNotebook.Tab",
+                    background=C["bg2"], foreground=C["text1"],
+                    padding=(14, 6), font=("Consolas", 9, "bold"),
+                    borderwidth=0)
+        s.map("TNotebook.Tab",
+              background=[("selected", C["bg1"])],
+              foreground=[("selected", C["accent"])],
+              expand=[("selected", [0, 2, 0, 0])])
 
     # ── Build ─────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -312,15 +345,20 @@ class App(tk.Tk):
         self.status_lbl.grid(row=0, column=7, sticky="e")
         self._refresh_ports()
 
-        # Body
-        body = tk.Frame(self, bg=C["bg0"])
-        body.pack(fill="both", expand=True, padx=8, pady=8)
-        body.columnconfigure(0, weight=3, minsize=520)
-        body.columnconfigure(1, weight=2, minsize=300)
-        body.rowconfigure(0, weight=1)
+        # ── Notebook (tabs) ───────────────────────────────────────────────
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
-        left  = tk.Frame(body, bg=C["bg0"])
-        right = tk.Frame(body, bg=C["bg0"])
+        # ── Tab 1: MPU Config (existing layout, unchanged) ────────────────
+        mpu_tab = tk.Frame(self.notebook, bg=C["bg0"])
+        self.notebook.add(mpu_tab, text="  MPU Config  ")
+
+        mpu_tab.columnconfigure(0, weight=3, minsize=520)
+        mpu_tab.columnconfigure(1, weight=2, minsize=300)
+        mpu_tab.rowconfigure(0, weight=1)
+
+        left  = tk.Frame(mpu_tab, bg=C["bg0"])
+        right = tk.Frame(mpu_tab, bg=C["bg0"])
         left.grid( row=0, column=0, sticky="nsew", padx=(0, 4))
         right.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
         left.columnconfigure(0, weight=1)
@@ -346,6 +384,11 @@ class App(tk.Tk):
         Card(right, "GESTURE LOG").grid(row=1, column=0, sticky="nsew")
         self._build_log(right.winfo_children()[-1].body)
 
+        # ── Tab 2: Overlay Config ─────────────────────────────────────────
+        overlay_tab = tk.Frame(self.notebook, bg=C["bg0"])
+        self.notebook.add(overlay_tab, text="  Overlay Config  ")
+        self._build_overlay_tab(overlay_tab)
+
         # Bottom bar
         bot = tk.Frame(self, bg=C["bg0"],
                        highlightthickness=1, highlightbackground=C["border"])
@@ -355,8 +398,8 @@ class App(tk.Tk):
         for text, cmd, acc in [
             ("APPLY",           self._apply,         True),
             ("SAVE",            self._save_config,   False),
-            ("LOAD",            self._load_and_apply,False),
-            ("RESET DEFAULTS",  self._reset_defaults,False),
+            ("RESET",           self._reset_defaults,False),
+            ("CLOSE",           self._on_close,      False),
         ]:
             self._btn(inner, text, cmd, accent=acc).pack(side="left", padx=3)
 
@@ -393,11 +436,11 @@ class App(tk.Tk):
             cell.pack(side="left", padx=10)
             v = DeadzoneViz(cell, lbl)
             v.pack()
+            self.dead_vizzes[key] = v          # register BEFORE slider
             sl = PrecisionSlider(cell, 0.0, 20.0, 0.1,
                                  initial=self.cfg.get(key, 1.5), width=70,
                                  on_change=lambda val, k=key: self._on_dead(k, val))
             sl.pack(pady=(3,0))
-            self.dead_vizzes[key] = v
             self.dead_sliders[key] = sl
 
         tk.Frame(p, bg=C["border"], height=1).pack(fill="x", pady=4)
@@ -492,6 +535,305 @@ class App(tk.Tk):
         sb.grid(row=0, column=1, sticky="ns")
         self._btn(p, "CLEAR LOG", self._clear_log).pack(anchor="e", pady=(4,0))
 
+    def _build_overlay_tab(self, parent):
+        """Build the Overlay Configuration tab contents."""
+        import math as _math
+        self._math = _math
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=0)
+
+        self.overlay_sliders = {}
+
+        # Left column
+        left_col = tk.Frame(parent, bg=C["bg0"])
+        left_col.grid(row=0, column=0, sticky="nsew", padx=(10,5), pady=(10,5))
+        left_col.rowconfigure(0, weight=0)
+        left_col.rowconfigure(1, weight=1)
+        left_col.columnconfigure(0, weight=1)
+
+        card_icons = Card(left_col, "OVERLAY ICON SIZE")
+        card_icons.grid(row=0, column=0, sticky="ew", pady=(0,5))
+        p = card_icons.body
+
+        row_f = tk.Frame(p, bg=C["bg1"])
+        row_f.pack(fill="x", pady=4)
+        tk.Label(row_f, text="Icon radius (px)", bg=C["bg1"], fg=C["text1"],
+                 font=FONT_TINY, width=18, anchor="w").pack(side="left")
+        sl = PrecisionSlider(row_f, 10, 40, 1,
+                             initial=self.cfg.get("overlayIconRadius", 19),
+                             width=160,
+                             on_change=self._on_icon_radius_change)
+        sl.pack(side="left", padx=4)
+        self.overlay_sliders["overlayIconRadius"] = sl
+
+        preview_frame = tk.Frame(p, bg=C["bg2"],
+                                 highlightthickness=1,
+                                 highlightbackground=C["border"])
+        preview_frame.pack(fill="x", pady=(8,4))
+        self._icon_preview = tk.Canvas(preview_frame, width=220, height=130,
+                                       bg=C["bg2"], highlightthickness=0)
+        self._icon_preview.pack()
+        self._preview_anim_r   = float(self.cfg.get("overlayIconRadius", 19))
+        self._preview_target_r = self._preview_anim_r
+        self._preview_anim_id  = None
+        self._draw_icon_preview()
+
+        card_dwell = Card(left_col, "DWELL TIME")
+        card_dwell.grid(row=1, column=0, sticky="new", pady=(5,0))
+        pd = card_dwell.body
+        tk.Label(pd, text="How long the user must hover\\n"
+                          "over an icon before it triggers.",
+                 bg=C["bg1"], fg=C["text2"], font=FONT_TINY,
+                 justify="left").pack(anchor="w", pady=(0,10))
+        row_f = tk.Frame(pd, bg=C["bg1"])
+        row_f.pack(fill="x", pady=4)
+        tk.Label(row_f, text="Dwell time (s)", bg=C["bg1"], fg=C["text1"],
+                 font=FONT_TINY, width=18, anchor="w").pack(side="left")
+        sl = PrecisionSlider(row_f, 0.3, 5.0, 0.05,
+                             initial=self.cfg.get("dwellTime", 0.75), width=160)
+        sl.pack(side="left", padx=4)
+        self.overlay_sliders["dwellTime"] = sl
+
+        # Right column
+        right_col = tk.Frame(parent, bg=C["bg0"])
+        right_col.grid(row=0, column=1, sticky="nsew", padx=(5,10), pady=(10,5))
+        right_col.rowconfigure(0, weight=0)
+        right_col.rowconfigure(1, weight=1)
+        right_col.columnconfigure(0, weight=1)
+
+        card_scroll = Card(right_col, "OVERLAY SCROLL")
+        card_scroll.grid(row=0, column=0, sticky="ew", pady=(0,5))
+        p2 = card_scroll.body
+        row_f = tk.Frame(p2, bg=C["bg1"])
+        row_f.pack(fill="x", pady=4)
+        tk.Label(row_f, text="Scroll speed (ticks)", bg=C["bg1"], fg=C["text1"],
+                 font=FONT_TINY, width=18, anchor="w").pack(side="left")
+        sl = PrecisionSlider(row_f, 1, 10, 1,
+                             initial=self.cfg.get("scrollSpeed", 2), width=160)
+        sl.pack(side="left", padx=4)
+        self.overlay_sliders["scrollSpeed"] = sl
+
+        card_pos = Card(right_col, "ICON POSITIONS  (drag to place)")
+        card_pos.grid(row=1, column=0, sticky="nsew", pady=(5,0))
+        pp = card_pos.body
+        pp.rowconfigure(1, weight=1)
+        pp.columnconfigure(0, weight=1)
+        tk.Label(pp, text="Drag icons to set position. All positions\\n"
+                          "are manual. Defaults only apply on first run.",
+                 bg=C["bg1"], fg=C["text2"], font=FONT_TINY,
+                 justify="left").pack(anchor="w", pady=(0,4))
+        self._pos_canvas = tk.Canvas(pp, bg="#0a0c10",
+                                     highlightthickness=1,
+                                     highlightbackground=C["border"])
+        self._pos_canvas.pack(fill="both", expand=True, pady=(4,4))
+
+        self._SCREEN_W = 1920
+        self._SCREEN_H = 1080
+        self._drag_icon = None
+        self._icon_dots = {}
+        self._pos_canvas.bind("<Configure>", lambda e: self._redraw_pos_canvas())
+        self._pos_canvas.bind("<Button-1>",  self._on_pos_drag_start)
+        self._pos_canvas.bind("<B1-Motion>", self._on_pos_drag_move)
+        self._pos_canvas.bind("<ButtonRelease-1>", self._on_pos_drag_end)
+
+    def _on_icon_radius_change(self, val):
+        if not hasattr(self, '_preview_target_r'): return
+        self._preview_target_r = float(val)
+        if self._preview_anim_id is None:
+            self._preview_anim_step()
+
+    def _preview_anim_step(self):
+        diff = self._preview_target_r - self._preview_anim_r
+        if abs(diff) < 0.3:
+            self._preview_anim_r = self._preview_target_r
+            self._draw_icon_preview()
+            self._preview_anim_id = None
+            return
+        self._preview_anim_r += diff * 0.25
+        self._draw_icon_preview()
+        self._preview_anim_id = self.after(16, self._preview_anim_step)
+
+    def _draw_icon_preview(self):
+        if not hasattr(self, '_icon_preview'): return
+        c = self._icon_preview
+        c.delete("all")
+        r  = self._preview_anim_r
+        cx, cy = 110, 65
+        _m = self._math
+
+        for dr, a in [(12, 15), (7, 28)]:
+            gr = r + dr
+            g_val = int(212 * a / 255)
+            b_val = int(255 * a / 255)
+            col = f"#00{g_val:02x}{b_val:02x}"
+            c.create_oval(cx-gr, cy-gr, cx+gr, cy+gr, fill="", outline=col, width=1)
+
+        c.create_oval(cx-r, cy-r, cx+r, cy+r, fill="#1e2636", outline="", width=0)
+        inner = r * 0.7
+        c.create_oval(cx-inner, cy-inner, cx+inner, cy+inner, fill="#222d40", outline="", width=0)
+
+        ring_r = r + 4
+        prog   = 0.70
+        steps  = max(4, int(prog * 36))
+        for s in range(steps):
+            a1 = _m.radians(90 - s * (360 * prog / steps))
+            a2 = _m.radians(90 - (s+1) * (360 * prog / steps))
+            x1 = cx + ring_r * _m.cos(a1)
+            y1 = cy - ring_r * _m.sin(a1)
+            x2 = cx + ring_r * _m.cos(a2)
+            y2 = cy - ring_r * _m.sin(a2)
+            frac = s / max(steps, 1)
+            gv = int(180 + 75 * frac)
+            bv = int(255 - 40 * frac)
+            col = f"#00{gv:02x}{bv:02x}"
+            c.create_line(x1, y1, x2, y2, fill=col, width=2)
+
+        c.create_oval(cx-r, cy-r, cx+r, cy+r, fill="", outline=C["accent"], width=1.5)
+
+        fs = max(8, int(r * 0.45))
+        c.create_text(cx, cy - 2, text="[C]", fill=C["text0"], font=("Consolas", fs, "bold"))
+        c.create_text(cx, cy + r + 14, text=f"r = {int(round(self._preview_target_r))} px",
+                      fill=C["text1"], font=FONT_TINY)
+
+    def _get_region_bounds(self, name, sw, sh):
+        LEFT_ICONS = {"rc", "drag", "kb", "copy", "paste"}
+        if name in LEFT_ICONS:
+            return 0, sw * 0.4, 0, sh
+        else:
+            return sw * 0.6, sw, 0, sh
+            
+    def _map_to_canvas(self, name, ix, iy, sx, sy, sw, sh):
+        x_min, x_max, y_min, y_max = self._get_region_bounds(name, sw, sh)
+        px = sx + x_min + (ix / self._SCREEN_W) * (x_max - x_min)
+        py = sy + y_min + (iy / self._SCREEN_H) * (y_max - y_min)
+        return int(px), int(py)
+        
+    def _map_from_canvas(self, name, cx, cy, sx, sy, sw, sh):
+        x_min, x_max, y_min, y_max = self._get_region_bounds(name, sw, sh)
+        lx = cx - sx
+        ly = cy - sy
+        px = max(x_min, min(x_max, lx))
+        py = max(y_min, min(y_max, ly))
+        ix = ((px - x_min) / (x_max - x_min)) * self._SCREEN_W
+        iy = ((py - y_min) / (y_max - y_min)) * self._SCREEN_H
+        return int(ix), int(iy)
+
+    def _redraw_pos_canvas(self):
+        if not hasattr(self, '_pos_canvas'): return
+        c = self._pos_canvas
+        c.delete("all")
+        cw, ch = c.winfo_width(), c.winfo_height()
+        if cw < 20 or ch < 20: return
+        m = 8
+        sx, sy, sw, sh = m, m, cw - m*2, ch - m*2
+        c.create_rectangle(sx, sy, sx+sw, sy+sh, outline=C["border2"], fill="#0e1018", width=1)
+        
+        # Draw regions
+        c.create_rectangle(sx, sy, sx + sw * 0.4, sy + sh, fill=C["bg1"], outline=C["border"])
+        c.create_rectangle(sx + sw * 0.6, sy, sx + sw, sy + sh, fill=C["bg1"], outline=C["border"])
+        c.create_text(sx + sw * 0.5, sy + sh * 0.5, text="SCREEN\nGAP", fill=C["text2"], font=("Consolas", 10), justify="center")
+        
+        self._icon_dots = {}
+        icons_to_draw = [
+            ("rc",    C["amber"],  "rcIconX",   "rcIconY",   "[⧉] DblClk"),
+            ("drag",  C["purple"], "dragIconX", "dragIconY", "[↕] Drag"),
+            ("kb",    "#ff00ff",   "kbIconX",   "kbIconY",   "[⌨] KB"),
+            ("copy",  C["accent"], "copyIconX", "copyIconY", "[📋] Copy"),
+            ("paste", C["green"],  "pasteIconX","pasteIconY","[📌] Paste"),
+            ("main",  "#ffffff",   "mainBtnX",  "mainBtnY",  "[●] Main"),
+            ("up",    C["accent2"],"scrollUpX", "scrollUpY", "[▲] Up"),
+            ("down",  C["accent2"],"scrollDownX","scrollDownY","[▼] Down")
+        ]
+        
+        DEFAULT_OVERLAY_POSITIONS = {
+            "rc": (300, 300),
+            "drag": (380, 300),
+            "kb": (460, 300),
+            "copy": (540, 300),
+            "paste": (620, 300),
+            "main": (380, 380),
+            "up": (300, 460),
+            "down": (460, 460)
+        }
+        
+        for name, color, xk, yk, lbl in icons_to_draw:
+            ix = self.cfg.get(xk)
+            iy = self.cfg.get(yk)
+            
+            if ix is None or ix == -1:
+                ix = DEFAULT_OVERLAY_POSITIONS.get(name, (20, 20))[0]
+            if iy is None or iy == -1:
+                iy = DEFAULT_OVERLAY_POSITIONS.get(name, (20, 20))[1]
+                
+            ix = max(0, min(self._SCREEN_W, ix))
+            iy = max(0, min(self._SCREEN_H, iy))
+            
+            x_min, x_max, y_min, y_max = self._get_region_bounds(name, sw, sh)
+            px = sx + x_min + (ix / self._SCREEN_W) * (x_max - x_min)
+            py = sy + y_min + (iy / self._SCREEN_H) * (y_max - y_min)
+            r = 8
+            dot = c.create_oval(px-r, py-r, px+r, py+r, fill=color, outline="#ffffff", width=1, tags=(name,))
+            c.create_text(px+14, py, text=lbl, fill=C["text1"], font=("Consolas", 7), anchor="w", tags=(f"{name}_lbl",))
+            self._icon_dots[name] = dot
+
+    def _on_pos_drag_start(self, event):
+        c = self._pos_canvas
+        for item in c.find_overlapping(event.x-10, event.y-10, event.x+10, event.y+10):
+            tags = c.gettags(item)
+            for name in ["rc", "drag", "kb", "copy", "paste", "main", "up", "down"]:
+                if name in tags:
+                    self._drag_icon = name
+                    return
+        self._drag_icon = None
+
+    def _on_pos_drag_move(self, event):
+        if not self._drag_icon: return
+        c = self._pos_canvas
+        m = 8
+        cw, ch = c.winfo_width(), c.winfo_height()
+        sx, sy, sw, sh = m, m, cw - m*2, ch - m*2
+        
+        x_min, x_max, y_min, y_max = self._get_region_bounds(self._drag_icon, sw, sh)
+        lx = event.x - sx
+        ly = event.y - sy
+        nx = sx + max(x_min, min(x_max, lx))
+        ny = sy + max(y_min, min(y_max, ly))
+        dot = self._icon_dots.get(self._drag_icon)
+        if dot:
+            c.coords(dot, nx-8, ny-8, nx+8, ny+8)
+            lbl = c.find_withtag(f"{self._drag_icon}_lbl")
+            if lbl:
+                c.coords(lbl[0], nx+14, ny)
+
+    def _on_pos_drag_end(self, event):
+        if not self._drag_icon: return
+        c = self._pos_canvas
+        m = 8
+        cw, ch = c.winfo_width(), c.winfo_height()
+        sx, sy, sw, sh = m, m, cw - m*2, ch - m*2
+        
+        scr_x, scr_y = self._map_from_canvas(self._drag_icon, event.x, event.y, sx, sy, sw, sh)
+        
+        if self._drag_icon == "rc":
+            self.cfg["rcIconX"], self.cfg["rcIconY"] = scr_x, scr_y
+        elif self._drag_icon == "drag":
+            self.cfg["dragIconX"], self.cfg["dragIconY"] = scr_x, scr_y
+        elif self._drag_icon == "kb":
+            self.cfg["kbIconX"], self.cfg["kbIconY"] = scr_x, scr_y
+        elif self._drag_icon == "copy":
+            self.cfg["copyIconX"], self.cfg["copyIconY"] = scr_x, scr_y
+        elif self._drag_icon == "paste":
+            self.cfg["pasteIconX"], self.cfg["pasteIconY"] = scr_x, scr_y
+        elif self._drag_icon == "main":
+            self.cfg["mainBtnX"], self.cfg["mainBtnY"] = scr_x, scr_y
+        elif self._drag_icon == "up":
+            self.cfg["scrollUpX"], self.cfg["scrollUpY"] = scr_x, scr_y
+        elif self._drag_icon == "down":
+            self.cfg["scrollDownX"], self.cfg["scrollDownY"] = scr_x, scr_y
+            
+        self._drag_icon = None
     # ── Live loop ─────────────────────────────────────────────────────────────
     def _live_loop(self):
         dead_axis = {
@@ -523,7 +865,8 @@ class App(tk.Tk):
                          highlightthickness=1, highlightbackground=C["border"])
 
     def _on_dead(self, key, val):
-        self.dead_vizzes[key].set_dead(val)
+        if key in self.dead_vizzes:
+            self.dead_vizzes[key].set_dead(val)
 
     # ── Widget ↔ cfg ──────────────────────────────────────────────────────────
     def _apply_cfg_to_widgets(self):
@@ -539,6 +882,10 @@ class App(tk.Tk):
             sl.set(self.cfg.get(k, 0.3))
         for k, sl in self.thresh_sliders.items():
             sl.set(self.cfg.get(k, sl.get()))
+        for k, sl in self.overlay_sliders.items():
+            sl.set(self.cfg.get(k, sl.get()))
+        # redraw canvas to reflect reset config
+        self.after(50, lambda: hasattr(self, '_pos_canvas') and self._redraw_pos_canvas())
 
     def _widgets_to_cfg(self):
         for k, v in self.axis_vars.items():
@@ -549,6 +896,7 @@ class App(tk.Tk):
         for k, sl in self.dead_sliders.items(): self.cfg[k] = sl.get()
         for k, sl in self.gain_sliders.items(): self.cfg[k] = sl.get()
         for k, sl in self.thresh_sliders.items(): self.cfg[k] = sl.get()
+        for k, sl in self.overlay_sliders.items(): self.cfg[k] = sl.get()
 
     # ── Serial callbacks ──────────────────────────────────────────────────────
     def _on_data(self, axes):     self.axes = axes
@@ -595,26 +943,40 @@ class App(tk.Tk):
 
     def _apply(self):
         self._widgets_to_cfg()
+        ov_out = {k: v for k, v in self.cfg.items() if k in OVERLAY_KEYS}
+        try:
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.sendto(json.dumps(ov_out).encode('utf-8'), ("127.0.0.1", 55555))
+        except Exception:
+            pass
         if self.serial and self.serial.connected:
-            self.serial.send({"cfg": self.cfg})
-        else:
-            messagebox.showinfo("Not connected", "Connect to ESP32 first.")
+            mpu_out = {k: v for k, v in self.cfg.items() if k not in OVERLAY_KEYS}
+            self.serial.send({"cfg": mpu_out})
 
     def _save_config(self):
         self._widgets_to_cfg()
-        with open(SAVE_FILE, "w") as f: json.dump(self.cfg, f, indent=2)
+        self._saved_cfg = dict(self.cfg)
+        mpu_out = {k: v for k, v in self.cfg.items() if k not in OVERLAY_KEYS}
+        ov_out  = {k: v for k, v in self.cfg.items() if k in OVERLAY_KEYS}
+        with open(SAVE_FILE, "w") as f: json.dump(mpu_out, f, indent=2)
+        with open(OVERLAY_FILE, "w") as f: json.dump(ov_out, f, indent=2)
         self._set_status("ack")
 
     def _load_config(self):
         try:
             with open(SAVE_FILE) as f: self.cfg.update(json.load(f))
         except (FileNotFoundError, json.JSONDecodeError): pass
+        try:
+            with open(OVERLAY_FILE) as f: self.cfg.update(json.load(f))
+        except (FileNotFoundError, json.JSONDecodeError): pass
+        self._saved_cfg = dict(self.cfg)
 
     def _load_and_apply(self):
         self._load_config(); self._apply_cfg_to_widgets(); self._apply()
 
     def _reset_defaults(self):
-        self.cfg = dict(DEFAULT_CFG); self._apply_cfg_to_widgets(); self._apply()
+        self.cfg = dict(DEFAULT_CFG); self._apply_cfg_to_widgets()
 
     def _on_close(self):
         if self.serial: self.serial.stop()

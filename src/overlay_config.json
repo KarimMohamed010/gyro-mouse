@@ -1,0 +1,21 @@
+{
+  "scrollSpeed": 4,
+  "overlayIconRadius": 19,
+  "dwellTime": 0.75,
+  "rcIconX": 20,
+  "rcIconY": 300,
+  "dragIconX": 20,
+  "dragIconY": 380,
+  "kbIconX": 20,
+  "kbIconY": 460,
+  "copyIconX": 20,
+  "copyIconY": 540,
+  "pasteIconX": 20,
+  "pasteIconY": 620,
+  "scrollUpX": 380,
+  "scrollUpY": 300,
+  "mainBtnX": 380,
+  "mainBtnY": 380,
+  "scrollDownX": 380,
+  "scrollDownY": 460
+}
