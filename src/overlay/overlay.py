@@ -61,6 +61,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from enum import Enum, auto
 
@@ -74,6 +75,14 @@ from PySide6.QtGui     import (
 )
 
 from modern_keyboard import KeyboardManager as ModernKeyboardManager
+
+try:
+    import hid
+    HID_AVAILABLE = True
+except ImportError:
+    hid = None
+    HID_AVAILABLE = False
+    print("[DwellClick] hidapi not found - HID gestures disabled. pip install hidapi")
 
 try:
     from pynput.mouse    import Button, Controller as MouseController
@@ -115,6 +124,15 @@ LEFT_PAD            = 4      # px panel from left edge
 CURSOR_RING_R       = 26
 CURSOR_RING_W       = 3
 TIMER_MS            = 16
+
+# ESP32 composite HID gesture report.
+HID_VID             = 0xE502
+HID_PID             = 0xA111
+HID_PRODUCT         = "ESP32 MPU Mouse"
+REPORT_ID_GESTURE  = 2
+GESTURE_NAMES       = {1: "Flick", 2: "Shake", 3: "DoubleTilt", 4: "Circle"}
+GESTURE_AXES        = ["YAW", "PITCH", "ROLL", ""]
+GESTURE_TOAST_MS    = 1600
 
 # Keyboard
 KB_KEY_SIZE         = 46     # px key width/height
@@ -1163,6 +1181,141 @@ class CursorRing(QWidget):
 # MainController
 # ─────────────────────────────────────────────────────────────────────────────
 
+def decode_hid_gesture(report) -> str | None:
+    data = list(report or [])
+    if len(data) >= 3 and data[0] == REPORT_ID_GESTURE:
+        gesture_id, gesture_data = data[1], data[2]
+    elif len(data) >= 2:
+        gesture_id, gesture_data = data[0], data[1]
+    else:
+        return None
+
+    name = GESTURE_NAMES.get(gesture_id, f"Gesture {gesture_id}")
+    axis_idx = gesture_data & 0x03
+    axis = GESTURE_AXES[axis_idx] if axis_idx < len(GESTURE_AXES) else ""
+    if gesture_id in (1, 3) and axis:
+        axis += "+" if gesture_data & 0x80 else "-"
+    return f"{name} {axis}".strip()
+
+
+class HidGestureListener(QObject):
+    gesture = Signal(str)
+    status = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._stop = threading.Event()
+        self._thread = None
+        self._dev = None
+
+    def start(self):
+        if not HID_AVAILABLE:
+            self.status.emit("hidapi unavailable")
+            return
+        self._thread = threading.Thread(target=self._run, name="hid-gesture-listener", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._dev:
+            try:
+                self._dev.close()
+            except Exception:
+                pass
+
+    def _open_device(self):
+        matches = hid.enumerate(HID_VID, HID_PID)
+        preferred = None
+        for item in matches:
+            product = item.get("product_string") or ""
+            if HID_PRODUCT.lower() in product.lower():
+                preferred = item
+                break
+        if preferred is None and matches:
+            preferred = matches[0]
+        if preferred is None:
+            raise RuntimeError("ESP32 HID device not found")
+        dev = hid.device()
+        dev.open_path(preferred["path"])
+        dev.set_nonblocking(True)
+        return dev
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                self._dev = self._open_device()
+                self.status.emit("HID gestures connected")
+                while not self._stop.is_set():
+                    report = self._dev.read(64)
+                    msg = decode_hid_gesture(report)
+                    if msg:
+                        self.gesture.emit(msg)
+                    time.sleep(0.02)
+            except Exception as exc:
+                if not self._stop.is_set():
+                    self.status.emit(f"HID gestures waiting: {exc}")
+                    time.sleep(2.0)
+            finally:
+                if self._dev:
+                    try:
+                        self._dev.close()
+                    except Exception:
+                        pass
+                    self._dev = None
+
+
+class GestureToast(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._text = ""
+        self._alpha = 0.0
+        self._shown_t = 0.0
+        self.setFixedSize(300, 72)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
+            Qt.Tool | Qt.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.hide()
+
+    def show_message(self, text: str):
+        self._text = text
+        self._alpha = 1.0
+        self._shown_t = time.monotonic()
+        screen = QApplication.primaryScreen()
+        if screen:
+            g = screen.availableGeometry()
+            self.move(g.center().x() - self.width() // 2, g.top() + 42)
+        self.show()
+        self.update()
+
+    def tick(self):
+        if self._alpha <= 0:
+            return
+        elapsed_ms = (time.monotonic() - self._shown_t) * 1000.0
+        if elapsed_ms > GESTURE_TOAST_MS:
+            self._alpha = max(0.0, 1.0 - ((elapsed_ms - GESTURE_TOAST_MS) / 450.0))
+            if self._alpha <= 0:
+                self.hide()
+                return
+        self.update()
+
+    def paintEvent(self, _):
+        if self._alpha <= 0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        a = int(220 * self._alpha)
+        p.setBrush(QColor(18, 22, 30, a))
+        p.setPen(QPen(QColor(120, 180, 255, int(210 * self._alpha)), 1.2))
+        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 14, 14)
+        p.setPen(QColor(235, 240, 255, int(255 * self._alpha)))
+        p.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        p.drawText(self.rect(), Qt.AlignCenter, self._text)
+        p.end()
+
+
 class MainController(QObject):
     def __init__(self):
         super().__init__()
@@ -1189,6 +1342,11 @@ class MainController(QObject):
         self._left   = LeftPanel()
         self._ring   = CursorRing()
         self._kb     = ModernKeyboardManager()
+        self._gesture_toast = GestureToast()
+        self._hid_gestures = HidGestureListener()
+        self._hid_gestures.gesture.connect(self._on_hid_gesture)
+        self._hid_gestures.status.connect(lambda s: print(f"[DwellClick] {s}"))
+        self._hid_gestures.start()
 
         self._right.arm_left.connect(self._on_arm_left)
         self._right.arm_right.connect(self._on_arm_right)
@@ -1202,7 +1360,7 @@ class MainController(QObject):
         self._right.show()
         self._left.show()
         if self._user32:
-            for widget in (self._right, self._left, self._ring):
+            for widget in (self._right, self._left, self._ring, self._gesture_toast):
                 try:
                     hwnd = int(widget.winId())
                     if hwnd:
@@ -1273,6 +1431,14 @@ class MainController(QObject):
                 self._dwell.update(x, y)
 
         self._ring.tick(delta)
+        self._gesture_toast.tick()
+
+    def stop(self):
+        self._hid_gestures.stop()
+
+    def _on_hid_gesture(self, text: str):
+        print(f"[DwellClick] HID gesture: {text}")
+        self._gesture_toast.show_message(text)
 
     def _store_target_window(self, x: int, y: int):
         if not self._user32:
@@ -1531,6 +1697,7 @@ def main():
     app.setQuitOnLastWindowClosed(False)
 
     ctrl = MainController()  # noqa
+    app.aboutToQuit.connect(ctrl.stop)
 
     import signal
     signal.signal(signal.SIGINT, lambda *_: app.quit())

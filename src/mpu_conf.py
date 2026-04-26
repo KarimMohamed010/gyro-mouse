@@ -7,7 +7,11 @@ Requirements: pip install bleak
 import json, threading, time, asyncio, struct
 import tkinter as tk
 from tkinter import ttk, messagebox
-from bleak import BleakClient, BleakScanner
+import serial, serial.tools.list_ports
+try:
+    import hid
+except ImportError:
+    hid = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 AXIS_NAMES  = ["Yaw (0)", "Pitch (1)", "Roll (2)"]
@@ -25,6 +29,25 @@ DEFAULT_CFG = {
     "enableDoubleTilt": True, "enableCircle": True,
 }
 
+HID_VID = 0xE502
+HID_PID = 0xA111
+HID_PRODUCT = "ESP32 MPU Mouse"
+REPORT_ID_GESTURE = 2
+REPORT_ID_FEATURE = 3
+FEATURE_PAGE_BASIC = 0
+FEATURE_PAGE_GAINS = 1
+FEATURE_PAGE_FLICK = 2
+FEATURE_PAGE_OTHER_GESTURES = 3
+FEATURE_PAGE_SELECT = 0x7F
+
+GESTURE_NAMES = {
+    1: "Flick",
+    2: "Shake",
+    3: "DoubleTilt",
+    4: "Circle",
+}
+AXIS_SHORT = ["YAW", "PITCH", "ROLL", ""]
+
 C = {
     "bg0":    "#0d0f12", "bg1": "#13161b", "bg2": "#1a1e25", "bg3": "#222733",
     "border": "#2a3040", "border2": "#3a4558",
@@ -36,10 +59,118 @@ FONT_MONO  = ("Consolas", 9)
 FONT_TINY  = ("Consolas", 8)
 FONT_HEAD  = ("Segoe UI", 9, "bold")
 
-# BLE UUIDs
-RAW_DATA_CHAR_UUID = "abcd0001-5678-1234-5678-1234567890ab"
-GESTURE_CHAR_UUID  = "abcd0002-5678-1234-5678-1234567890ab"
-CONFIG_CHAR_UUID   = "abcd0004-5678-1234-5678-1234567890ab"
+
+def _u8_scaled(value, scale=10.0):
+    return max(0, min(255, int(round(float(value) * scale))))
+
+
+def _u16_scaled(value, scale=1.0):
+    return max(0, min(65535, int(round(float(value) * scale))))
+
+
+def _put_u16(buf, idx, value):
+    value = int(value) & 0xFFFF
+    buf[idx] = value & 0xFF
+    buf[idx + 1] = (value >> 8) & 0xFF
+
+
+def _get_u16(buf, idx):
+    return int(buf[idx]) | (int(buf[idx + 1]) << 8)
+
+
+def cfg_to_feature_pages(cfg):
+    pages = []
+    p = [0] * 8
+    p[0] = FEATURE_PAGE_BASIC
+    p[1] = ((int(cfg.get("cursorXAxis", 0)) & 0x03)
+            | ((int(cfg.get("cursorYAxis", 2)) & 0x03) << 2)
+            | ((int(cfg.get("clickAxis", 1)) & 0x03) << 4))
+    p[2] = ((0x01 if cfg.get("invertX", False) else 0)
+            | (0x02 if cfg.get("invertY", False) else 0)
+            | (0x04 if cfg.get("invertClick", False) else 0)
+            | (0x10 if cfg.get("enableFlick", True) else 0)
+            | (0x20 if cfg.get("enableShake", True) else 0)
+            | (0x40 if cfg.get("enableDoubleTilt", True) else 0)
+            | (0x80 if cfg.get("enableCircle", True) else 0))
+    p[3] = _u8_scaled(cfg.get("deadzoneX", 1.5))
+    p[4] = _u8_scaled(cfg.get("deadzoneY", 1.5))
+    p[5] = _u8_scaled(cfg.get("deadzoneClick", 2.0))
+    p[6] = _u8_scaled(cfg.get("tiltThreshDeg", cfg.get("clickThreshDeg", 30.0)))
+    pages.append(p)
+
+    p = [0] * 8
+    p[0] = FEATURE_PAGE_GAINS
+    _put_u16(p, 1, _u16_scaled(cfg.get("gainX", 0.3), 100.0))
+    _put_u16(p, 3, _u16_scaled(cfg.get("gainY", 0.3), 100.0))
+    pages.append(p)
+
+    p = [0] * 8
+    p[0] = FEATURE_PAGE_FLICK
+    _put_u16(p, 1, _u16_scaled(cfg.get("flickVelThresh", 120.0)))
+    p[3] = _u8_scaled(cfg.get("flickReturnDeg", 8.0))
+    _put_u16(p, 4, _u16_scaled(cfg.get("flickConfirmMs", 300.0)))
+    pages.append(p)
+
+    p = [0] * 8
+    p[0] = FEATURE_PAGE_OTHER_GESTURES
+    _put_u16(p, 1, _u16_scaled(cfg.get("shakeVelThresh", 60.0)))
+    p[3] = _u8_scaled(cfg.get("doubleTiltDeg", 25.0))
+    _put_u16(p, 4, _u16_scaled(cfg.get("circleMinSpeed", 20.0)))
+    pages.append(p)
+    return pages
+
+
+def merge_feature_page(cfg, payload):
+    if len(payload) != 8:
+        return
+    page = payload[0]
+    if page == FEATURE_PAGE_BASIC:
+        packed_axes = payload[1]
+        flags = payload[2]
+        cfg["cursorXAxis"] = packed_axes & 0x03
+        cfg["cursorYAxis"] = (packed_axes >> 2) & 0x03
+        cfg["clickAxis"] = (packed_axes >> 4) & 0x03
+        cfg["invertX"] = bool(flags & 0x01)
+        cfg["invertY"] = bool(flags & 0x02)
+        cfg["invertClick"] = bool(flags & 0x04)
+        cfg["enableFlick"] = bool(flags & 0x10)
+        cfg["enableShake"] = bool(flags & 0x20)
+        cfg["enableDoubleTilt"] = bool(flags & 0x40)
+        cfg["enableCircle"] = bool(flags & 0x80)
+        cfg["deadzoneX"] = payload[3] / 10.0
+        cfg["deadzoneY"] = payload[4] / 10.0
+        cfg["deadzoneClick"] = payload[5] / 10.0
+        cfg["tiltThreshDeg"] = payload[6] / 10.0
+        cfg["clickThreshDeg"] = cfg["tiltThreshDeg"]
+    elif page == FEATURE_PAGE_GAINS:
+        cfg["gainX"] = _get_u16(payload, 1) / 100.0
+        cfg["gainY"] = _get_u16(payload, 3) / 100.0
+    elif page == FEATURE_PAGE_FLICK:
+        cfg["flickVelThresh"] = float(_get_u16(payload, 1))
+        cfg["flickReturnDeg"] = payload[3] / 10.0
+        cfg["flickConfirmMs"] = float(_get_u16(payload, 4))
+    elif page == FEATURE_PAGE_OTHER_GESTURES:
+        cfg["shakeVelThresh"] = float(_get_u16(payload, 1))
+        cfg["doubleTiltDeg"] = payload[3] / 10.0
+        cfg["circleMinSpeed"] = float(_get_u16(payload, 4))
+
+
+def decode_gesture_report(report):
+    data = list(report)
+    if len(data) >= 3 and data[0] == REPORT_ID_GESTURE:
+        gesture_id, gesture_data = data[1], data[2]
+    elif len(data) >= 2:
+        gesture_id, gesture_data = data[0], data[1]
+    else:
+        return None
+
+    name = GESTURE_NAMES.get(gesture_id, f"Gesture{gesture_id}")
+    axis_idx = gesture_data & 0x03
+    axis = AXIS_SHORT[axis_idx] if axis_idx < len(AXIS_SHORT) else ""
+    if gesture_id in (1, 3) and axis:
+        axis += "+" if (gesture_data & 0x80) else "-"
+    return {"gesture": name, "axis": axis}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 class BleConfigThread(threading.Thread):
@@ -120,14 +251,88 @@ class BleConfigThread(threading.Thread):
             self.connected = False
 
     def send(self, payload):
-        if self.connected and self._loop:
-            asyncio.run_coroutine_threadsafe(self._write_queue.put(payload), self._loop)
+        if self.ser and self.ser.is_open:
+            self.ser.write((json.dumps(payload) + "\n").encode())
 
     def stop(self):
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._stop.set)
+        self._stop.set()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
+class HIDThread(threading.Thread):
+    def __init__(self, on_gesture, on_status):
+        super().__init__(daemon=True)
+        self.on_gesture, self.on_status = on_gesture, on_status
+        self._stop = threading.Event()
+        self.dev = None
+        self.connected = False
+        self._lock = threading.Lock()
+
+    def _open_device(self):
+        if hid is None:
+            raise RuntimeError("hidapi is not installed")
+        matches = hid.enumerate(HID_VID, HID_PID)
+        preferred = None
+        for item in matches:
+            product = item.get("product_string") or ""
+            if HID_PRODUCT.lower() in product.lower():
+                preferred = item
+                break
+        if preferred is None and matches:
+            preferred = matches[0]
+        if preferred is None:
+            raise RuntimeError("ESP32 HID device not found")
+        dev = hid.device()
+        dev.open_path(preferred["path"])
+        dev.set_nonblocking(True)
+        return dev
+
+    def run(self):
+        try:
+            self.dev = self._open_device()
+            self.connected = True
+            self.on_status("connected")
+            while not self._stop.is_set():
+                with self._lock:
+                    report = self.dev.read(64)
+                if report:
+                    msg = decode_gesture_report(report)
+                    if msg:
+                        self.on_gesture(msg)
+                time.sleep(0.02)
+        except Exception as e:
+            self.on_status(f"error:{e}")
+        finally:
+            self.connected = False
+            if self.dev:
+                try:
+                    self.dev.close()
+                except Exception:
+                    pass
+
+    def send_feature(self, payload8):
+        if not self.connected or not self.dev:
+            raise RuntimeError("HID device is not connected")
+        if len(payload8) != 8:
+            raise ValueError("feature payload must be 8 bytes")
+        with self._lock:
+            return self.dev.send_feature_report(bytes([REPORT_ID_FEATURE] + list(payload8)))
+
+    def get_feature(self, page):
+        self.send_feature([FEATURE_PAGE_SELECT, page, 0, 0, 0, 0, 0, 0])
+        time.sleep(0.03)
+        with self._lock:
+            data = list(self.dev.get_feature_report(REPORT_ID_FEATURE, 9))
+        if len(data) >= 9 and data[0] == REPORT_ID_FEATURE:
+            return data[1:9]
+        if len(data) >= 8:
+            return data[:8]
+        raise RuntimeError("short feature report")
+
+    def stop(self):
+        self._stop.set()
+
+
 class PrecisionSlider(tk.Frame):
     """Slider + spinbox for coarse drag AND precise keyboard/type tuning."""
 
@@ -295,7 +500,8 @@ class App(tk.Tk):
         self.minsize(880, 620)
 
         self.cfg    = dict(DEFAULT_CFG)
-        self.ble_thread = None
+        self.serial = None
+        self.hid_thread = None
         self.axes   = [0.0, 0.0, 0.0]
         self.device_addresses = {}
 
@@ -640,22 +846,34 @@ class App(tk.Tk):
         self._set_status("disconnected")
 
     def _connect(self):
-        display = self.device_var.get()
-        if not display or display not in self.device_addresses:
-            messagebox.showwarning("No device", "Scan and select a BLE device first.")
-            return
-        address = self.device_addresses[display]
-        if self.ble_thread: self.ble_thread.stop()
+        port = self.port_var.get()
+        if self.serial:
+            self.serial.stop()
+            self.serial = None
+        if self.hid_thread:
+            self.hid_thread.stop()
+            self.hid_thread = None
         self._set_status("connecting")
-        self.ble_thread = BleConfigThread(address, self._on_data, self._on_gesture, self._on_status)
-        self.ble_thread.start()
+        if port:
+            self.serial = SerialThread(port, 115200,
+                                       self._on_data, self._on_gesture, self._on_status)
+            self.serial.start()
+        self.hid_thread = HIDThread(self._on_gesture, self._on_status)
+        self.hid_thread.start()
 
     def _apply(self):
         self._widgets_to_cfg()
-        if self.ble_thread and self.ble_thread.connected:
-            self.ble_thread.send({"cfg": self.cfg})
-        else:
-            messagebox.showinfo("Not connected", "Connect to ESP32 first.")
+        if not self.hid_thread or not self.hid_thread.connected:
+            messagebox.showinfo("Not connected", "Connect to ESP32 HID first.")
+            return
+        try:
+            for page in cfg_to_feature_pages(self.cfg):
+                self.hid_thread.send_feature(page)
+                time.sleep(0.02)
+            self._set_status("ack")
+        except Exception as e:
+            messagebox.showerror("HID error", str(e))
+            self._set_status(f"error:{e}")
 
     def _save_config(self):
         self._widgets_to_cfg()
@@ -674,13 +892,26 @@ class App(tk.Tk):
         # remove normalization of shortcuts since it was undefined anyway
 
     def _load_and_apply(self):
-        self._load_config(); self._apply_cfg_to_widgets(); self._apply()
+        if self.hid_thread and self.hid_thread.connected:
+            try:
+                for page in (FEATURE_PAGE_BASIC, FEATURE_PAGE_GAINS,
+                             FEATURE_PAGE_FLICK, FEATURE_PAGE_OTHER_GESTURES):
+                    merge_feature_page(self.cfg, self.hid_thread.get_feature(page))
+                self._apply_cfg_to_widgets()
+                self._set_status("ack")
+                return
+            except Exception as e:
+                messagebox.showerror("HID error", str(e))
+                self._set_status(f"error:{e}")
+                return
+        self._load_config(); self._apply_cfg_to_widgets()
 
     def _reset_defaults(self):
         self.cfg = dict(DEFAULT_CFG); self._apply_cfg_to_widgets(); self._apply()
 
     def _on_close(self):
-        if self.ble_thread: self.ble_thread.stop()
+        if self.serial: self.serial.stop()
+        if self.hid_thread: self.hid_thread.stop()
         self.destroy()
 
 if __name__ == "__main__":
