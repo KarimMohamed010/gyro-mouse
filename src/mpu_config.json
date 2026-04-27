@@ -1,15 +1,15 @@
 {
   "cursorXAxis": 0,
-  "cursorYAxis": 2,
-  "clickAxis": 1,
+  "cursorYAxis": 1,
+  "clickAxis": 2,
   "invertX": false,
   "invertY": true,
   "invertClick": false,
   "deadzoneX": 1.5,
-  "deadzoneY": 1.5,
+  "deadzoneY": 0.3,
   "deadzoneClick": 2.0,
-  "gainX": 0.3,
-  "gainY": 0.3,
+  "gainX": 0.2,
+  "gainY": 0.2,
   "tiltThreshDeg": 30.0,
   "flickVelThresh": 120.0,
   "flickReturnDeg": 8.0,
@@ -20,5 +20,6 @@
   "enableFlick": true,
   "enableShake": true,
   "enableDoubleTilt": true,
-  "enableCircle": true
+  "enableCircle": true,
+  "enableClicks": false
 }

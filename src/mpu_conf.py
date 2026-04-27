@@ -635,9 +635,8 @@ class App(tk.Tk):
         inner.pack(side="right", padx=10, pady=6)
         for text, cmd, acc in [
             ("APPLY",          self._apply,          True),
-            ("SAVE",           self._save_config,    False),
             ("LOAD FROM DEVICE", self._load_and_apply, False),
-            ("RESET DEFAULTS", self._reset_defaults, False),
+            ("DEFAULTS", self._reset_defaults, False),
         ]:
             self._btn(inner, text, cmd, accent=acc).pack(side="left", padx=3)
 
@@ -893,6 +892,7 @@ class App(tk.Tk):
                 for page in pages:
                     self.hid_thread.send_feature(page)
                     time.sleep(0.02)
+                self._persist_cfg()
                 self.after(0, lambda: self._set_status("ack"))
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror("HID error", str(e)))
@@ -914,14 +914,12 @@ class App(tk.Tk):
                 self.after(0, lambda: messagebox.showerror("HID error", str(e)))
         threading.Thread(target=_send_recenter, daemon=True).start()
 
-    def _save_config(self):
-        self._widgets_to_cfg()
+    def _persist_cfg(self):
         try:
             with open(SAVE_FILE, "w") as f:
                 json.dump(self.cfg, f, indent=2)
-            self._set_status("ack")
         except OSError as e:
-            messagebox.showerror("Save error", str(e))
+            raise RuntimeError(str(e))
 
     def _load_config(self):
         try:
@@ -945,6 +943,7 @@ class App(tk.Tk):
             for page in (FEATURE_PAGE_BASIC, FEATURE_PAGE_GAINS,
                          FEATURE_PAGE_FLICK, FEATURE_PAGE_OTHER_GESTURES):
                 merge_feature_page(self.cfg, self.hid_thread.get_feature(page))
+            self._persist_cfg()
             self._apply_cfg_to_widgets()
             self._set_status("ack")
         except Exception as e:
@@ -954,7 +953,14 @@ class App(tk.Tk):
     def _reset_defaults(self):
         self.cfg = dict(DEFAULT_CFG)
         self._apply_cfg_to_widgets()
-        self._apply()
+        if self.hid_thread and self.hid_thread.connected:
+            self._apply()
+            return
+        try:
+            self._persist_cfg()
+            self._set_status("ack")
+        except Exception as e:
+            messagebox.showerror("Save error", str(e))
 
     def _on_close(self):
         if self.hid_thread: self.hid_thread.stop()
