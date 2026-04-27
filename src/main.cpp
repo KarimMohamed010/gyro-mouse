@@ -33,6 +33,12 @@ constexpr uint8_t AXIS_YAW = 0;
 constexpr uint8_t AXIS_PITCH = 1;
 constexpr uint8_t AXIS_ROLL = 2;
 
+// Mount correction for the board rotation: Z 180 deg, then Y 90 deg.
+constexpr float MOUNT_QW = 0.0f;
+constexpr float MOUNT_QX = -0.70710678f;
+constexpr float MOUNT_QY = 0.0f;
+constexpr float MOUNT_QZ = -0.70710678f;
+
 // ─── Gesture IDs ─────────────────────────────────────────────────────────────
 constexpr uint8_t GESTURE_FLICK = 1;
 constexpr uint8_t GESTURE_SHAKE = 2;
@@ -48,6 +54,7 @@ constexpr uint8_t FEATURE_PAGE_FLICK = 2;
 constexpr uint8_t FEATURE_PAGE_OTHER_GESTURES = 3;
 constexpr uint8_t FEATURE_PAGE_COMMAND = 0x7E;
 constexpr uint8_t FEATURE_PAGE_SELECT = 0x7F;
+constexpr uint8_t CONFIG_VERSION = 2;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -172,6 +179,7 @@ void saveConfig()
 {
   sanitizeConfig();
   prefs.begin("mpu", false);
+  prefs.putUChar("cfgver", CONFIG_VERSION);
   prefs.putBytes("cfg", &cfg, sizeof(cfg));
   prefs.end();
 }
@@ -180,10 +188,14 @@ void loadConfig()
 {
   cfg = Config{};
   prefs.begin("mpu", true);
-  if (prefs.isKey("cfg"))
+  const bool hasCurrentConfig = prefs.isKey("cfg") &&
+                                prefs.getUChar("cfgver", 0) == CONFIG_VERSION;
+  if (hasCurrentConfig)
     prefs.getBytes("cfg", &cfg, sizeof(cfg));
   prefs.end();
   sanitizeConfig();
+  if (!hasCurrentConfig)
+    saveConfig();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -672,6 +684,7 @@ MPU6050 mpu;
 bool dmpReady = false;
 uint8_t fifoBuffer[64] = {};
 Quaternion q;
+Quaternion qMountCorrection(MOUNT_QW, MOUNT_QX, MOUNT_QY, MOUNT_QZ);
 VectorFloat gravity;
 VectorInt16 aa, gg;
 float ypr[3] = {};
@@ -760,8 +773,10 @@ void loop()
   mpu.dmpGetQuaternion(&q, fifoBuffer);
   mpu.dmpGetAccel(&aa, fifoBuffer);
   mpu.dmpGetGyro(&gg, fifoBuffer);
-  mpu.dmpGetGravity(&gravity, &q);
-  mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+  Quaternion qCorrected = q.getProduct(qMountCorrection);
+  qCorrected.normalize();
+  mpu.dmpGetGravity(&gravity, &qCorrected);
+  mpu.dmpGetYawPitchRoll(ypr, &qCorrected, &gravity);
 
   const float yawDeg = ypr[0] * RAD_TO_DEG;
   const float pitchDeg = ypr[1] * RAD_TO_DEG;

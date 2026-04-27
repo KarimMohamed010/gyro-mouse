@@ -116,41 +116,41 @@ def cfg_to_feature_pages(cfg):
 
     p = [0] * 8
     p[0] = FEATURE_PAGE_BASIC
-    p[1] = ((int(cfg.get("cursorXAxis", 0)) & 0x03)
-            | ((int(cfg.get("cursorYAxis", 2)) & 0x03) << 2)
-            | ((int(cfg.get("clickAxis",   1)) & 0x03) << 4))
-    p[2] = ((0x01 if cfg.get("invertX",        False) else 0)
-            | (0x02 if cfg.get("invertY",       False) else 0)
-            | (0x04 if cfg.get("invertClick",   False) else 0)
-            | (0x08 if cfg.get("enableClicks",  True)  else 0)
-            | (0x10 if cfg.get("enableFlick",   True)  else 0)
-            | (0x20 if cfg.get("enableShake",   True)  else 0)
-            | (0x40 if cfg.get("enableDoubleTilt", True) else 0)
-            | (0x80 if cfg.get("enableCircle",  True)  else 0))
-    p[3] = _u8(cfg.get("deadzoneX",     1.5))
-    p[4] = _u8(cfg.get("deadzoneY",     1.5))
-    p[5] = _u8(cfg.get("deadzoneClick", 2.0))
-    p[6] = _u8(cfg.get("tiltThreshDeg", 30.0))
+    p[1] = ((int(cfg.get("cursorXAxis", DEFAULT_CFG["cursorXAxis"])) & 0x03)
+            | ((int(cfg.get("cursorYAxis", DEFAULT_CFG["cursorYAxis"])) & 0x03) << 2)
+            | ((int(cfg.get("clickAxis",   DEFAULT_CFG["clickAxis"])) & 0x03) << 4))
+    p[2] = ((0x01 if cfg.get("invertX",        DEFAULT_CFG["invertX"]) else 0)
+            | (0x02 if cfg.get("invertY",       DEFAULT_CFG["invertY"]) else 0)
+            | (0x04 if cfg.get("invertClick",   DEFAULT_CFG["invertClick"]) else 0)
+            | (0x08 if cfg.get("enableClicks",  DEFAULT_CFG["enableClicks"])  else 0)
+            | (0x10 if cfg.get("enableFlick",   DEFAULT_CFG["enableFlick"])  else 0)
+            | (0x20 if cfg.get("enableShake",   DEFAULT_CFG["enableShake"])  else 0)
+            | (0x40 if cfg.get("enableDoubleTilt", DEFAULT_CFG["enableDoubleTilt"]) else 0)
+            | (0x80 if cfg.get("enableCircle",  DEFAULT_CFG["enableCircle"])  else 0))
+    p[3] = _u8(cfg.get("deadzoneX",     DEFAULT_CFG["deadzoneX"]))
+    p[4] = _u8(cfg.get("deadzoneY",     DEFAULT_CFG["deadzoneY"]))
+    p[5] = _u8(cfg.get("deadzoneClick", DEFAULT_CFG["deadzoneClick"]))
+    p[6] = _u8(cfg.get("tiltThreshDeg", DEFAULT_CFG["tiltThreshDeg"]))
     pages.append(p)
 
     p = [0] * 8
     p[0] = FEATURE_PAGE_GAINS
-    _put16(p, 1, _u16(cfg.get("gainX", 0.3), 100.0))
-    _put16(p, 3, _u16(cfg.get("gainY", 0.3), 100.0))
+    _put16(p, 1, _u16(cfg.get("gainX", DEFAULT_CFG["gainX"]), 100.0))
+    _put16(p, 3, _u16(cfg.get("gainY", DEFAULT_CFG["gainY"]), 100.0))
     pages.append(p)
 
     p = [0] * 8
     p[0] = FEATURE_PAGE_FLICK
-    _put16(p, 1, _u16(cfg.get("flickVelThresh", 120.0)))
-    p[3] = _u8(cfg.get("flickReturnDeg", 8.0))
-    _put16(p, 4, _u16(cfg.get("flickConfirmMs", 300.0)))
+    _put16(p, 1, _u16(cfg.get("flickVelThresh", DEFAULT_CFG["flickVelThresh"])))
+    p[3] = _u8(cfg.get("flickReturnDeg", DEFAULT_CFG["flickReturnDeg"]))
+    _put16(p, 4, _u16(cfg.get("flickConfirmMs", DEFAULT_CFG["flickConfirmMs"])))
     pages.append(p)
 
     p = [0] * 8
     p[0] = FEATURE_PAGE_OTHER_GESTURES
-    _put16(p, 1, _u16(cfg.get("shakeVelThresh", 60.0)))
-    p[3] = _u8(cfg.get("doubleTiltDeg",  25.0))
-    _put16(p, 4, _u16(cfg.get("circleMinSpeed", 20.0)))
+    _put16(p, 1, _u16(cfg.get("shakeVelThresh", DEFAULT_CFG["shakeVelThresh"])))
+    p[3] = _u8(cfg.get("doubleTiltDeg",  DEFAULT_CFG["doubleTiltDeg"]))
+    _put16(p, 4, _u16(cfg.get("circleMinSpeed", DEFAULT_CFG["circleMinSpeed"])))
     pages.append(p)
 
     return pages
