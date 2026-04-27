@@ -1275,13 +1275,17 @@ class HidGestureListener(QObject):
     def _open_device(self):
         matches   = hid.enumerate(HID_VID, HID_PID)
         preferred = None
+        fallback  = None
         for item in matches:
             product = item.get("product_string") or ""
             if HID_PRODUCT.lower() in product.lower():
-                preferred = item
-                break
-        if preferred is None and matches:
-            preferred = matches[0]
+                if fallback is None:
+                    fallback = item
+                if item.get("usage_page") == 65280 and item.get("usage") == 1:
+                    preferred = item
+                    break
+        if preferred is None:
+            preferred = fallback if fallback is not None else (matches[0] if matches else None)
         if preferred is None:
             raise RuntimeError("ESP32 HID device not found")
         dev = hid.device()

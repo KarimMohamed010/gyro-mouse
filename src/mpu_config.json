@@ -8,7 +8,7 @@
   "deadzoneX": 1.5,
   "deadzoneY": 0.3,
   "deadzoneClick": 2.0,
-  "gainX": 0.6,
+  "gainX": 0.91,
   "gainY": 0.65,
   "tiltThreshDeg": 30.0,
   "flickVelThresh": 120.0,

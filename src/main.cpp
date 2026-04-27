@@ -224,6 +224,21 @@ bool hidConnected = false;
 uint32_t hidConnectedSinceMs = 0;
 uint8_t currentFeaturePage = FEATURE_PAGE_BASIC;
 
+void enableInputNotifications(BLECharacteristic *input)
+{
+  if (!input)
+    return;
+  BLE2902 *cccd = static_cast<BLE2902 *>(input->getDescriptorByUUID(BLEUUID((uint16_t)0x2902)));
+  if (cccd)
+    cccd->setNotifications(true);
+}
+
+void enableHidInputNotifications()
+{
+  enableInputNotifications(mouseInput);
+  enableInputNotifications(gestureInput);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Feature report encode / decode
 // ─────────────────────────────────────────────────────────────────────────────
@@ -350,6 +365,7 @@ class HidServerCallbacks : public BLEServerCallbacks
   {
     hidConnected = true;
     hidConnectedSinceMs = millis();
+    enableHidInputNotifications();
     requestRecenter = true;
   }
   void onDisconnect(BLEServer *server) override
@@ -409,6 +425,7 @@ void setupHID()
   mouseInput = hid->inputReport(REPORT_ID_MOUSE);
   gestureInput = hid->inputReport(REPORT_ID_GESTURE);
   featureReport = hid->featureReport(REPORT_ID_FEATURE);
+  enableHidInputNotifications();
   featureReport->setCallbacks(new FeatureCallbacks());
 
   hid->manufacturer()->setValue("Espressif");
