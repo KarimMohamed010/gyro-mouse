@@ -67,6 +67,9 @@ FEATURE_PAGE_FLICK           = 2
 FEATURE_PAGE_OTHER_GESTURES  = 3
 FEATURE_PAGE_SELECT          = 0x7F
 
+AUTO_CONNECT_POLL_MS = 1500
+AUTO_CALIBRATION_MS = 2500
+
 GESTURE_NAMES = {1: "Flick", 2: "Shake", 3: "DoubleTilt", 4: "Circle"}
 AXIS_SHORT    = ["YAW", "PITCH", "ROLL", ""]
 
@@ -283,6 +286,7 @@ class HIDThread(threading.Thread):
                     self.dev_feature.close()
             except Exception:
                 pass
+            self.on_status("disconnected")
 
     def send_feature(self, payload8):
         if not self.connected or not self.dev_feature:
@@ -539,6 +543,7 @@ class App(tk.Tk):
         self.hid_thread = None
         self.hotkey_listener = None
         self.axes       = [0.0, 0.0, 0.0]
+        self._auto_recenter_job = None
 
         self._load_config()
         self._setup_style()
@@ -547,6 +552,7 @@ class App(tk.Tk):
         self._setup_hotkey()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._live_loop()
+        self.after(300, self._auto_connect_loop)
 
     def _setup_style(self):
         s = ttk.Style(self)
@@ -838,12 +844,55 @@ class App(tk.Tk):
     def _on_status(self, code): self.after(0, lambda: self._set_status(code))
 
     def _set_status(self, code):
-        if   code == "connected":       text, col = "CONNECTED",     C["green"]
+        if   code == "connected":
+            self._start_connect_calibration()
+            return
+        elif code == "connecting":      text, col = "CONNECTING...", C["amber"]
+        elif code == "calibrating":     text, col = "CALIBRATING... STAY STILL", C["amber"]
+        elif code == "waiting":         text, col = "WAITING FOR BLUETOOTH", C["text1"]
         elif code == "ack":             text, col = "CFG APPLIED ✓", C["green"]
-        elif code.startswith("error:"): text, col = "ERROR",         C["red"]
+        elif code.startswith("error:"):
+            msg = code[6:].strip().lower()
+            if "not found" in msg or "paired and connected" in msg:
+                text, col = "WAITING FOR BLUETOOTH", C["text1"]
+            else:
+                text, col = "ERROR", C["red"]
         else:                           text, col = "DISCONNECTED",  C["red"]
         self.status_lbl.configure(text=text, fg=col)
         self.led.itemconfig(self._led, fill=col)
+
+    def _start_connect_calibration(self):
+        self._set_status("calibrating")
+        self._log_info("Calibrating: keep device still for a few seconds...")
+        if self._auto_recenter_job is not None:
+            try:
+                self.after_cancel(self._auto_recenter_job)
+            except Exception:
+                pass
+        self._auto_recenter_job = self.after(
+            AUTO_CALIBRATION_MS,
+            lambda: self._recenter(silent=True)
+        )
+
+    def _auto_connect_loop(self):
+        if not self.winfo_exists():
+            return
+        if hid is None:
+            self._set_status("error:hid library unavailable")
+        else:
+            if self.hid_thread and not self.hid_thread.is_alive():
+                self.hid_thread = None
+            if not self.hid_thread:
+                self._set_status("waiting")
+                self._connect(silent=True)
+        self.after(AUTO_CONNECT_POLL_MS, self._auto_connect_loop)
+
+    def _log_info(self, text):
+        line = f"[{time.strftime('%H:%M:%S')}]  {text}\n"
+        self.gesture_log.configure(state="normal")
+        self.gesture_log.insert("end", line)
+        self.gesture_log.see("end")
+        self.gesture_log.configure(state="disabled")
 
     def _log_gesture(self, msg):
         text = (f"[{time.strftime('%H:%M:%S')}]  "
@@ -861,10 +910,15 @@ class App(tk.Tk):
         self.gesture_log.configure(state="disabled")
 
     # ── Actions ───────────────────────────────────────────────────────────────
-    def _connect(self):
+    def _connect(self, silent=False):
         """Open the HID interface. The device must already be BT-paired."""
         if hid is None:
-            messagebox.showerror("HID library error", hid_import_diagnostic())
+            if not silent:
+                messagebox.showerror("HID library error", hid_import_diagnostic())
+            return
+        if self.hid_thread and self.hid_thread.connected:
+            return
+        if self.hid_thread and self.hid_thread.is_alive():
             return
         if self.hid_thread:
             self.hid_thread.stop()
@@ -965,6 +1019,11 @@ class App(tk.Tk):
     def _on_close(self):
         if self.hid_thread: self.hid_thread.stop()
         if self.hotkey_listener: self.hotkey_listener.stop()
+        if self._auto_recenter_job is not None:
+            try:
+                self.after_cancel(self._auto_recenter_job)
+            except Exception:
+                pass
         self.destroy()
 
 
