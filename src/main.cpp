@@ -103,6 +103,15 @@ inline float applyDeadband(float v, float db)
 {
   return fabsf(v) < db ? 0.f : v;
 }
+inline float angleDeltaDeg(float currentDeg, float referenceDeg)
+{
+  float delta = currentDeg - referenceDeg;
+  while (delta > 180.f)
+    delta -= 360.f;
+  while (delta < -180.f)
+    delta += 360.f;
+  return delta;
+}
 inline float getAxis(uint8_t idx)
 {
   return (idx < 3) ? axes[idx] : 0.f;
@@ -470,7 +479,7 @@ void detectGestures(uint32_t nowMs)
   float vel[3];
   for (int i = 0; i < 3; i++)
   {
-    vel[i] = (axes[i] - gs.prevAxes[i]) / dt;
+    vel[i] = angleDeltaDeg(axes[i], gs.prevAxes[i]) / dt;
     gs.prevAxes[i] = axes[i];
   }
   gs.prevFrameMs = nowMs;
@@ -497,7 +506,7 @@ void detectGestures(uint32_t nowMs)
       {
         if (nowMs - fa.armedMs > cfg.flickConfirmMs)
           fa.phase = 0;
-        else if (fabsf(axes[i] - fa.originAngle) < cfg.flickReturnDeg)
+        else if (fabsf(angleDeltaDeg(axes[i], fa.originAngle)) < cfg.flickReturnDeg)
         {
           if (!onCooldown)
           {
@@ -737,16 +746,21 @@ void loop()
   mpu.dmpGetGravity(&gravity, &q);
   mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
+  const float yawDeg = ypr[0] * RAD_TO_DEG;
+  const float pitchDeg = ypr[1] * RAD_TO_DEG;
+  const float rollDeg = ypr[2] * RAD_TO_DEG;
+
   if (requestRecenter) {
-      idleOffset[AXIS_YAW] = ypr[0] * RAD_TO_DEG;
-      idleOffset[AXIS_PITCH] = ypr[1] * RAD_TO_DEG;
-      idleOffset[AXIS_ROLL] = ypr[2] * RAD_TO_DEG;
+      idleOffset[AXIS_YAW] = yawDeg;
+      idleOffset[AXIS_PITCH] = pitchDeg;
+      idleOffset[AXIS_ROLL] = rollDeg;
+      gs = GestureState{};
       requestRecenter = false;
   }
 
-  axes[AXIS_YAW] = ypr[0] * RAD_TO_DEG - idleOffset[AXIS_YAW];
-  axes[AXIS_PITCH] = ypr[1] * RAD_TO_DEG - idleOffset[AXIS_PITCH];
-  axes[AXIS_ROLL] = ypr[2] * RAD_TO_DEG - idleOffset[AXIS_ROLL];
+  axes[AXIS_YAW] = angleDeltaDeg(yawDeg, idleOffset[AXIS_YAW]);
+  axes[AXIS_PITCH] = angleDeltaDeg(pitchDeg, idleOffset[AXIS_PITCH]);
+  axes[AXIS_ROLL] = angleDeltaDeg(rollDeg, idleOffset[AXIS_ROLL]);
 
   const float rawX = applyDeadband(getAxis(cfg.cursorXAxis), cfg.deadzoneX);
   const float rawY = applyDeadband(getAxis(cfg.cursorYAxis), cfg.deadzoneY);
