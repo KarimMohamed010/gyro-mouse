@@ -64,7 +64,6 @@ import sys
 import threading
 import time
 from enum import Enum, auto
-
 from ctypes import wintypes
 
 from PySide6.QtWidgets import QApplication, QWidget
@@ -74,7 +73,8 @@ from PySide6.QtGui     import (
     QRadialGradient, QCursor
 )
 
-from modern_keyboard import KeyboardManager as ModernKeyboardManager
+# NOTE: modern_keyboard is NOT a separate module — KeyboardManager is defined
+# in this file. The import that was here previously has been removed.
 
 try:
     import hid
@@ -118,21 +118,21 @@ MAIN_BTN_R          = 26     # px
 SCROLL_BTN_R        = 16     # px
 ACTION_BTN_R        = 19     # px
 BTN_GAP             = 10     # px
-RIGHT_PAD           = 4      # px panel from right edge
-LEFT_PAD            = 4      # px panel from left edge
+RIGHT_PAD           = 4      # px panel inset from right edge
+LEFT_PAD            = 4      # px panel inset from left edge
 
 CURSOR_RING_R       = 26
 CURSOR_RING_W       = 3
 TIMER_MS            = 16
 
-# ESP32 composite HID gesture report.
-HID_VID             = 0xE502
-HID_PID             = 0xA111
-HID_PRODUCT         = "ESP32 MPU Mouse"
+# ESP32 composite HID gesture report
+HID_VID            = 0xE502
+HID_PID            = 0xA111
+HID_PRODUCT        = "ESP32 MPU Mouse"
 REPORT_ID_GESTURE  = 2
-GESTURE_NAMES       = {1: "Flick", 2: "Shake", 3: "DoubleTilt", 4: "Circle"}
-GESTURE_AXES        = ["YAW", "PITCH", "ROLL", ""]
-GESTURE_TOAST_MS    = 1600
+GESTURE_NAMES      = {1: "Flick", 2: "Shake", 3: "DoubleTilt", 4: "Circle"}
+GESTURE_AXES       = ["YAW", "PITCH", "ROLL", ""]
+GESTURE_TOAST_MS   = 1600
 
 # Keyboard
 KB_KEY_SIZE         = 46     # px key width/height
@@ -172,7 +172,6 @@ C_RING_R    = QColor(238, 128,  38, 255)
 C_RING_BG   = QColor(255, 255, 255,  20)
 C_SAFE_PILL = QColor(255, 255, 255,  12)
 
-# Keyboard colors
 C_KB_BG     = QColor(22,  24,  32,  230)
 C_KB_KEY    = QColor(48,  52,  68,  230)
 C_KB_HOVER  = QColor(80,  100, 200, 240)
@@ -186,13 +185,13 @@ C_KB_TEXT   = QColor(235, 235, 240, 255)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class State(Enum):
-    IDLE     = auto()
-    ARMED_L  = auto()
-    ARMED_R  = auto()
-    ARMED_DBL = auto()
+    IDLE       = auto()
+    ARMED_L    = auto()
+    ARMED_R    = auto()
+    ARMED_DBL  = auto()
     ARMED_DRAG = auto()
-    CLICK    = auto()
-    DRAGGING = auto()
+    CLICK      = auto()
+    DRAGGING   = auto()
 
 
 class DragPhase(Enum):
@@ -272,6 +271,7 @@ def draw_ring(p: QPainter, cx, cy, r, prog, fg, lw=2.4):
         p.setPen(QPen(fg, lw, Qt.SolidLine, Qt.RoundCap))
         p.drawArc(rect, 90 * 16, -int(prog * 360 * 16))
 
+
 def draw_dot(p: QPainter, cx, cy, r, color):
     p.setBrush(QBrush(color))
     p.setPen(Qt.NoPen)
@@ -279,10 +279,10 @@ def draw_dot(p: QPainter, cx, cy, r, color):
 
 
 if sys.platform == "win32":
-    USER32 = ctypes.windll.user32
+    USER32   = ctypes.windll.user32
     WM_CLOSE = 0x0010
 else:
-    USER32 = None
+    USER32   = None
     WM_CLOSE = 0
 
 
@@ -298,12 +298,16 @@ def ring_color_for_state(state: State) -> QColor | None:
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SystemKeyboardBridge — wraps the Windows on-screen keyboard (osk.exe)
+# ─────────────────────────────────────────────────────────────────────────────
+
 class SystemKeyboardBridge(QObject):
-    """Thin wrapper around the Windows on-screen keyboard."""
+    """Thin wrapper around the Windows on-screen keyboard (osk.exe)."""
 
     def __init__(self):
         super().__init__()
-        self._exe = self._resolve_exe()
+        self._exe  = self._resolve_exe()
         self._proc = None
 
     def _resolve_exe(self):
@@ -311,7 +315,10 @@ class SystemKeyboardBridge(QObject):
             return None
         candidates = [
             shutil.which("osk.exe"),
-            os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "osk.exe"),
+            os.path.join(
+                os.environ.get("SystemRoot", r"C:\Windows"),
+                "System32", "osk.exe"
+            ),
         ]
         for path in candidates:
             if path and os.path.exists(path):
@@ -321,13 +328,17 @@ class SystemKeyboardBridge(QObject):
     def available(self) -> bool:
         return bool(self._exe)
 
+    def is_visible(self) -> bool:
+        """Return True if the OSK window is currently on screen."""
+        return self._find_window() != 0
+
     def uses_external_dwell(self) -> bool:
-        return self.isVisible()
+        return self.is_visible()
 
     def show_near(self, _x: int, _y: int) -> bool:
         if not self.available():
             return False
-        if self.isVisible():
+        if self.is_visible():
             return True
         try:
             self._proc = subprocess.Popen([self._exe])
@@ -349,16 +360,16 @@ class SystemKeyboardBridge(QObject):
         self._proc = None
 
     def update_cursor(self, _x: int, _y: int):
-        pass
+        pass   # OSK handles its own input
 
     def contains(self, x: int, y: int) -> bool:
-        rect = self.geometry()
-        if not rect:
+        rect = self._get_geometry()
+        if rect is None:
             return False
         left, top, right, bottom = rect
         return left <= x <= right and top <= y <= bottom
 
-    def geometry(self):
+    def _get_geometry(self):
         hwnd = self._find_window()
         if not hwnd:
             return None
@@ -366,9 +377,6 @@ class SystemKeyboardBridge(QObject):
         if not USER32.GetWindowRect(hwnd, ctypes.byref(rect)):
             return None
         return rect.left, rect.top, rect.right, rect.bottom
-
-    def isVisible(self) -> bool:
-        return self.geometry() is not None
 
     def _find_window(self):
         if not self.available():
@@ -379,83 +387,41 @@ class SystemKeyboardBridge(QObject):
         return 0
 
 
-class KeyboardManager(QObject):
-    """Uses the system keyboard when available, otherwise falls back in-app."""
-
-    def __init__(self):
-        super().__init__()
-        self._system = SystemKeyboardBridge()
-        self._fallback = DwellKeyboard()
-        self._mode = "system" if self._system.available() else "fallback"
-
-    def show_near(self, x: int, y: int):
-        if self._mode == "system":
-            if self._system.show_near(x, y):
-                return
-            print("[DwellClick] Falling back to built-in dwell keyboard.")
-            self._mode = "fallback"
-        self._fallback.show_near(x, y)
-
-    def hide(self):
-        self._system.hide()
-        self._fallback.hide()
-
-    def contains(self, x: int, y: int) -> bool:
-        if self._mode == "system":
-            return self._system.contains(x, y)
-        return self._fallback.contains(x, y)
-
-    def update_cursor(self, x: int, y: int):
-        if self._mode == "fallback":
-            self._fallback.update_cursor(x, y)
-        else:
-            self._system.update_cursor(x, y)
-
-    def isVisible(self) -> bool:
-        if self._mode == "system":
-            return self._system.isVisible()
-        return self._fallback.isVisible()
-
-    def uses_external_dwell(self) -> bool:
-        return self._mode == "system" and self._system.uses_external_dwell()
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# DwellKeyboard — floating keyboard overlay
+# DwellKeyboard — floating keyboard overlay (fallback when OSK unavailable)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DwellKeyboard(QWidget):
     """
-    Floating keyboard that appears near the cursor.
-    Each key has its own DwellTracker — hover a key → ring fills → types it.
-    No arm state needed. Keyboard is its own safe zone.
-    Signals: closed() when user dwells the keyboard trigger again.
+    Floating keyboard overlay driven entirely by the cursor-feed from
+    MainController.update_cursor(). No mouse events needed — the widget
+    uses WindowTransparentForInput so it never steals focus.
+    Each key has its own DwellTracker. Keyboard is its own safe zone.
     """
 
     closed = Signal()
 
     def __init__(self):
         super().__init__()
-        self._numeric   = False
-        self._keys      = []          # list of (label, rect_local)
-        self._prog      = {}          # label → progress 0..1
-        self._hover_key = None
-        self._trackers  = {}          # label → DwellTracker
+        self._numeric       = False
+        self._keys          = []    # list of (label, QRectF)
+        self._prog          = {}    # label → progress 0..1
+        self._hover_key     = None
+        self._trackers      = {}    # label → DwellTracker
         self._last_typed_at = 0.0
 
-        # Build layout
         self._build_layout()
 
+        # All flags set together — setWindowFlag() replaces the whole set,
+        # so we always use setWindowFlags() with the complete combination.
         self.setWindowFlags(
             Qt.FramelessWindowHint  |
             Qt.WindowStaysOnTopHint |
-            Qt.Tool
+            Qt.Tool                 |
+            Qt.WindowTransparentForInput   # cursor feed is driven externally
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-        # NOT WindowTransparentForInput — keyboard needs to receive updates
-        # but we drive it from MainController cursor feed anyway
-        self.setWindowFlag(Qt.WindowTransparentForInput)
         self.hide()
 
     def _build_layout(self):
@@ -463,14 +429,9 @@ class DwellKeyboard(QWidget):
         ks   = KB_KEY_SIZE
         gap  = KB_KEY_GAP
 
-        # Calculate total size
-        max_cols = max(len(r) for r in rows)
-
-        # Build key rects — handle special wide keys
         self._keys = []
         y = gap
         for row in rows:
-            row_width = sum(self._key_w(k) for k in row) + gap * (len(row) - 1)
             x = gap
             for label in row:
                 kw = self._key_w(label)
@@ -483,10 +444,9 @@ class DwellKeyboard(QWidget):
             for r in rows
         )
         total_h = y + gap
-
         self.setFixedSize(int(total_w), int(total_h))
 
-        # Create/reset trackers for each unique key
+        # Re-use existing trackers where possible to avoid dropped progress
         old = self._trackers
         self._trackers = {}
         for label, _ in self._keys:
@@ -495,10 +455,17 @@ class DwellKeyboard(QWidget):
                 t.reset()
             else:
                 t = DwellTracker(DWELL_KEY, once_only=False)
-                t.complete.connect(lambda _x, _y, lbl=label: self._on_key_dwell(lbl))
-                t.progress.connect(lambda prog, lbl=label: self._on_key_prog(lbl, prog))
-                t.cancelled.connect(lambda lbl=label: self._on_key_cancel(lbl))
+                t.complete.connect(
+                    lambda _x, _y, lbl=label: self._on_key_dwell(lbl)
+                )
+                t.progress.connect(
+                    lambda prog, lbl=label: self._on_key_prog(lbl, prog)
+                )
+                t.cancelled.connect(
+                    lambda lbl=label: self._on_key_cancel(lbl)
+                )
             self._trackers[label] = t
+
         self._prog = {k: 0.0 for k, _ in self._keys}
 
     def _key_w(self, label: str) -> int:
@@ -509,11 +476,11 @@ class DwellKeyboard(QWidget):
         return KB_KEY_SIZE
 
     def show_near(self, x: int, y: int):
-        scr  = QApplication.primaryScreen().geometry()
-        px   = min(x + 20, scr.right()  - self.width()  - 10)
-        py   = min(y + 20, scr.bottom() - self.height() - 10)
-        px   = max(px, scr.left() + 10)
-        py   = max(py, scr.top()  + 10)
+        scr = QApplication.primaryScreen().geometry()
+        px  = min(x + 20, scr.right()  - self.width()  - 10)
+        py  = min(y + 20, scr.bottom() - self.height() - 10)
+        px  = max(px, scr.left() + 10)
+        py  = max(py, scr.top()  + 10)
         self.move(px, py)
         self.show()
         self.raise_()
@@ -533,7 +500,6 @@ class DwellKeyboard(QWidget):
                 hit = label
                 break
 
-        # Feed tracker for hovered key; cancel others
         for label, tracker in self._trackers.items():
             if label == hit:
                 tracker.update(x, y)
@@ -560,7 +526,7 @@ class DwellKeyboard(QWidget):
             return
         self._last_typed_at = now
 
-        if label == "toggle_num" or label in ("123", "ABC"):
+        if label in ("123", "ABC"):
             self._numeric = not self._numeric
             self._build_layout()
             self.update()
@@ -571,17 +537,19 @@ class DwellKeyboard(QWidget):
 
     def _type_key(self, label: str):
         if not PYNPUT_AVAILABLE:
-            out = KB_SPECIAL.get(label, label)
-            print(f"[Keyboard] TYPE: {out!r}")
+            print(f"[Keyboard] TYPE: {KB_SPECIAL.get(label, label)!r}")
             return
         try:
             kb = KbController()
             if label == "⌫":
-                kb.press(Key.backspace); kb.release(Key.backspace)
+                kb.press(Key.backspace)
+                kb.release(Key.backspace)
             elif label == "⏎":
-                kb.press(Key.enter);     kb.release(Key.enter)
+                kb.press(Key.enter)
+                kb.release(Key.enter)
             elif label == "Space":
-                kb.press(Key.space);     kb.release(Key.space)
+                kb.press(Key.space)
+                kb.release(Key.space)
             else:
                 kb.type(label)
         except Exception as e:
@@ -591,20 +559,18 @@ class DwellKeyboard(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
 
-        # Background
         p.setBrush(QBrush(C_KB_BG))
         p.setPen(Qt.NoPen)
         p.drawRoundedRect(QRectF(0, 0, self.width(), self.height()), 10, 10)
 
-        font = QFont("Consolas", 11, QFont.Medium)
-        font_sm = QFont("Consolas", 9, QFont.Medium)
+        font    = QFont("Consolas", 11, QFont.Medium)
+        font_sm = QFont("Consolas",  9, QFont.Medium)
 
         for label, rect in self._keys:
             prog  = self._prog.get(label, 0.0)
             hover = (label == self._hover_key)
             is_sp = label in KB_SPECIAL or label in ("ABC", "123")
 
-            # Key background
             if hover:
                 kc = QColor(C_KB_HOVER)
             elif is_sp:
@@ -612,7 +578,6 @@ class DwellKeyboard(QWidget):
             else:
                 kc = QColor(C_KB_KEY)
 
-            # Highlight fill based on progress
             if prog > 0:
                 filled = QColor(C_KB_PROG)
                 filled.setAlpha(int(prog * 180))
@@ -626,14 +591,12 @@ class DwellKeyboard(QWidget):
                 p.setPen(Qt.NoPen)
                 p.drawRoundedRect(rect, 6, 6)
 
-            # Progress arc on key edge
             if prog > 0:
                 cx = rect.center().x()
                 cy = rect.center().y()
                 rr = min(rect.width(), rect.height()) / 2 - 3
                 draw_ring(p, cx, cy, rr, prog, C_KB_PROG, 2.0)
 
-            # Label text
             p.setPen(QPen(C_KB_TEXT))
             p.setFont(font_sm if len(label) > 2 else font)
             p.drawText(rect, Qt.AlignCenter, label)
@@ -642,7 +605,50 @@ class DwellKeyboard(QWidget):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RightPanel — main arm button + scroll circles, always visible
+# KeyboardManager — uses OSK when available, falls back to DwellKeyboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+class KeyboardManager(QObject):
+    def __init__(self):
+        super().__init__()
+        self._system   = SystemKeyboardBridge()
+        self._fallback = DwellKeyboard()
+        self._mode     = "system" if self._system.available() else "fallback"
+
+    def show_near(self, x: int, y: int):
+        if self._mode == "system":
+            if self._system.show_near(x, y):
+                return
+            print("[DwellClick] Falling back to built-in dwell keyboard.")
+            self._mode = "fallback"
+        self._fallback.show_near(x, y)
+
+    def hide(self):
+        self._system.hide()
+        self._fallback.hide()
+
+    def contains(self, x: int, y: int) -> bool:
+        if self._mode == "system":
+            return self._system.contains(x, y)
+        return self._fallback.contains(x, y)
+
+    def update_cursor(self, x: int, y: int):
+        if self._mode == "fallback":
+            self._fallback.update_cursor(x, y)
+        # OSK handles its own input — nothing to do in system mode
+
+    def isVisible(self) -> bool:
+        if self._mode == "system":
+            return self._system.is_visible()   # use is_visible(), not isVisible()
+        return self._fallback.isVisible()
+
+    def uses_external_dwell(self) -> bool:
+        # OSK has its own dwell support; we don't drive it with our ring
+        return self._mode == "system" and self._system.is_visible()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RightPanel — main arm button + scroll circles
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RightPanel(QWidget):
@@ -653,8 +659,8 @@ class RightPanel(QWidget):
 
     def __init__(self):
         super().__init__()
-        mr = MAIN_BTN_R
-        sr = SCROLL_BTN_R
+        mr  = MAIN_BTN_R
+        sr  = SCROLL_BTN_R
         gap = BTN_GAP
         pw  = (max(mr, sr) + sr + 20) * 2
         ph  = mr * 2 + gap * 2 + sr * 2 + 32
@@ -667,21 +673,21 @@ class RightPanel(QWidget):
         self._mr   = mr
         self._sr   = sr
 
-        self._sys_state   = State.IDLE
-        self._main_hover  = False
-        self._main_prog   = 0.0
-        self._main_pulse  = 0.0
-        self._main_flash  = 0.0
+        self._sys_state  = State.IDLE
+        self._main_hover = False
+        self._main_prog  = 0.0
+        self._main_pulse = 0.0
+        self._main_flash = 0.0
 
-        self._su_hover    = False
-        self._su_prog     = 0.0
-        self._su_active   = False
-        self._su_held     = 0.0
+        self._su_hover  = False
+        self._su_prog   = 0.0
+        self._su_active = False
+        self._su_held   = 0.0
 
-        self._sd_hover    = False
-        self._sd_prog     = 0.0
-        self._sd_active   = False
-        self._sd_held     = 0.0
+        self._sd_hover  = False
+        self._sd_prog   = 0.0
+        self._sd_active = False
+        self._sd_held   = 0.0
 
         self._main_t = DwellTracker(DWELL_EDGE)
         self._main_t.progress.connect(self._mp)
@@ -698,8 +704,8 @@ class RightPanel(QWidget):
         self._sd_t.complete.connect(lambda x, y: self._sl(+1))
         self._sd_t.cancelled.connect(lambda: self._scancel(+1))
 
-        self._scroll_dir   = 0
-        self._scroll_held  = 0.0
+        self._scroll_dir  = 0
+        self._scroll_held = 0.0
         self._stimer = QTimer()
         self._stimer.setInterval(SCROLL_TICK_MS)
         self._stimer.timeout.connect(self._scroll_tick)
@@ -714,8 +720,10 @@ class RightPanel(QWidget):
 
     def _place(self):
         scr = QApplication.primaryScreen().geometry()
-        self.move(scr.right() - self.width() + RIGHT_PAD + self._sr + 4,
-                  scr.center().y() - self.height() // 2)
+        self.move(
+            scr.right() - self.width() + RIGHT_PAD + self._sr + 4,
+            scr.center().y() - self.height() // 2
+        )
 
     def contains(self, x, y):
         return self.geometry().contains(x, y)
@@ -735,22 +743,26 @@ class RightPanel(QWidget):
         lx, ly = x - geo.x(), y - geo.y()
         cx, cy = self._cx, self._cy
 
-        # Main
+        # Main button
         dm = math.hypot(lx - cx, ly - cy)
         wm = self._main_hover
         self._main_hover = dm < self._mr + 8
         if self._main_hover:
             self._main_t.update(x, y)
         elif wm:
-            self._main_t.reset(); self._main_prog = 0.0; self.update()
+            self._main_t.reset()
+            self._main_prog = 0.0
+            self.update()
 
         # Scroll up
         du = math.hypot(lx - cx, ly - self._su_y)
         wu = self._su_hover
         self._su_hover = du < self._sr + 8
         if self._su_hover:
-            if self._su_active: self._su_held += TIMER_MS / 1000.0
-            else:               self._su_t.update(x, y)
+            if self._su_active:
+                self._su_held += TIMER_MS / 1000.0
+            else:
+                self._su_t.update(x, y)
         elif wu:
             self._stop_scroll(-1)
 
@@ -759,8 +771,10 @@ class RightPanel(QWidget):
         wd = self._sd_hover
         self._sd_hover = dd < self._sr + 8
         if self._sd_hover:
-            if self._sd_active: self._sd_held += TIMER_MS / 1000.0
-            else:               self._sd_t.update(x, y)
+            if self._sd_active:
+                self._sd_held += TIMER_MS / 1000.0
+            else:
+                self._sd_t.update(x, y)
         elif wd:
             self._stop_scroll(+1)
 
@@ -771,9 +785,10 @@ class RightPanel(QWidget):
             self._main_flash = max(0.0, self._main_flash - delta * 5.0)
         self.update()
 
-    # main dwell
-    def _mp(self, p): self._main_prog = p; self.update()
-    def _mcancel(self): self._main_prog = 0.0; self.update()
+    # ── Main dwell callbacks ───────────────────────────────────────────────
+    def _mp(self, p):      self._main_prog = p; self.update()
+    def _mcancel(self):    self._main_prog = 0.0; self.update()
+
     def _mc(self, _x, _y):
         self._main_prog = 0.0
         if self._sys_state == State.ARMED_L:
@@ -783,7 +798,7 @@ class RightPanel(QWidget):
         else:
             self.arm_left.emit()
 
-    # scroll
+    # ── Scroll callbacks ───────────────────────────────────────────────────
     def _sp(self, p, d):
         if d == -1: self._su_prog = p
         else:       self._sd_prog = p
@@ -807,20 +822,23 @@ class RightPanel(QWidget):
     def _stop_scroll(self, d):
         if d == -1:
             self._su_active = False; self._su_held = 0.0
-            self._su_prog = 0.0; self._su_t.reset()
+            self._su_prog   = 0.0;   self._su_t.reset()
         else:
             self._sd_active = False; self._sd_held = 0.0
-            self._sd_prog = 0.0; self._sd_t.reset()
+            self._sd_prog   = 0.0;   self._sd_t.reset()
         if not self._su_active and not self._sd_active:
-            self._stimer.stop(); self._scroll_held = 0.0
+            self._stimer.stop()
+            self._scroll_held = 0.0
         self.update()
 
     def _scroll_tick(self):
         self._scroll_held += SCROLL_TICK_MS / 1000.0
         speed = min(
             SCROLL_SPEED_INIT + int(
-                (self._scroll_held / SCROLL_ACCEL_TIME) * (SCROLL_SPEED_MAX - SCROLL_SPEED_INIT)
-            ), SCROLL_SPEED_MAX
+                (self._scroll_held / SCROLL_ACCEL_TIME)
+                * (SCROLL_SPEED_MAX - SCROLL_SPEED_INIT)
+            ),
+            SCROLL_SPEED_MAX
         )
         self.scroll_evt.emit(self._scroll_dir * speed)
 
@@ -830,10 +848,12 @@ class RightPanel(QWidget):
         cx, cy = self._cx, self._cy
         mr, sr = float(self._mr), float(self._sr)
 
-        # Safe zone hint
+        # Safe-zone hint pill
         sh = QRectF(cx - mr - 2, self._su_y - sr - 4,
-                    (mr + 2) * 2, self._sd_y - self._su_y + sr * 2 + 8)
-        p.setBrush(QBrush(C_SAFE_PILL)); p.setPen(Qt.NoPen)
+                    (mr + 2) * 2,
+                    self._sd_y - self._su_y + sr * 2 + 8)
+        p.setBrush(QBrush(C_SAFE_PILL))
+        p.setPen(Qt.NoPen)
         p.drawRoundedRect(sh, mr + 2, mr + 2)
 
         # ── Main button ───────────────────────────────────────────────────
@@ -842,88 +862,104 @@ class RightPanel(QWidget):
         elif s == State.ARMED_L: body_c, ring_c = C_ARMED_L, C_RING_L
         else:                    body_c, ring_c = C_IDLE,    C_HOVER_L
 
-        # pulse glow
+        # Pulse glow when armed
         if s in (State.ARMED_L, State.ARMED_R):
             pv  = 0.5 + 0.5 * math.sin(self._main_pulse)
             gr  = mr + 6 + pv * 5
             glo = QRadialGradient(cx, cy, gr)
-            gc  = QColor(body_c); gc.setAlpha(int(48 + pv * 52))
-            glo.setColorAt(0, gc); glo.setColorAt(1, QColor(0,0,0,0))
-            p.setBrush(QBrush(glo)); p.setPen(Qt.NoPen)
+            gc  = QColor(body_c)
+            gc.setAlpha(int(48 + pv * 52))
+            glo.setColorAt(0, gc)
+            glo.setColorAt(1, QColor(0, 0, 0, 0))
+            p.setBrush(QBrush(glo))
+            p.setPen(Qt.NoPen)
             p.drawEllipse(QPointF(cx, cy), gr, gr)
 
-        # hover glow (idle)
+        # Hover glow (idle)
         if self._main_hover and s == State.IDLE:
             hg = QRadialGradient(cx, cy, mr + 12)
-            hc = QColor(C_HOVER_L); hc.setAlpha(42)
-            hg.setColorAt(0, hc); hg.setColorAt(1, QColor(0,0,0,0))
-            p.setBrush(QBrush(hg)); p.setPen(Qt.NoPen)
+            hc = QColor(C_HOVER_L)
+            hc.setAlpha(42)
+            hg.setColorAt(0, hc)
+            hg.setColorAt(1, QColor(0, 0, 0, 0))
+            p.setBrush(QBrush(hg))
+            p.setPen(Qt.NoPen)
             p.drawEllipse(QPointF(cx, cy), mr + 12, mr + 12)
 
-        # flash
+        # Click flash
         if self._main_flash > 0:
             fc = QColor(255, 255, 255, int(self._main_flash * 88))
-            p.setBrush(QBrush(fc)); p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(fc))
+            p.setPen(Qt.NoPen)
             p.drawEllipse(QPointF(cx, cy), mr + 3, mr + 3)
 
         draw_dot(p, cx, cy, mr, body_c)
 
-        # icon
+        # Icon
         ia  = 192 if (self._main_hover or s != State.IDLE) else 98
-        pen = QPen(QColor(255, 255, 255, ia), 2.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-        p.setPen(pen); p.setBrush(Qt.NoBrush)
+        pen = QPen(QColor(255, 255, 255, ia), 2.0,
+                   Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
         if s not in (State.ARMED_L, State.ARMED_R):
             for dy in (-5, 0, 5):
-                p.drawLine(QPointF(cx-6, cy+dy), QPointF(cx+6, cy+dy))
+                p.drawLine(QPointF(cx - 6, cy + dy), QPointF(cx + 6, cy + dy))
         elif s == State.ARMED_L:
-            p.drawLine(QPointF(cx-4, cy-5), QPointF(cx-4, cy+5))
-            p.drawLine(QPointF(cx-4, cy+5), QPointF(cx+4, cy+5))
+            p.drawLine(QPointF(cx - 4, cy - 5), QPointF(cx - 4, cy + 5))
+            p.drawLine(QPointF(cx - 4, cy + 5), QPointF(cx + 4, cy + 5))
         else:
-            p.drawLine(QPointF(cx-3, cy-5), QPointF(cx-3, cy+5))
-            p.drawLine(QPointF(cx-3, cy-5), QPointF(cx+3, cy-5))
-            p.drawLine(QPointF(cx+3, cy-5), QPointF(cx+3, cy-1))
-            p.drawLine(QPointF(cx-3, cy-1), QPointF(cx+3, cy-1))
-            p.drawLine(QPointF(cx,   cy-1), QPointF(cx+4, cy+5))
+            p.drawLine(QPointF(cx - 3, cy - 5), QPointF(cx - 3, cy + 5))
+            p.drawLine(QPointF(cx - 3, cy - 5), QPointF(cx + 3, cy - 5))
+            p.drawLine(QPointF(cx + 3, cy - 5), QPointF(cx + 3, cy - 1))
+            p.drawLine(QPointF(cx - 3, cy - 1), QPointF(cx + 3, cy - 1))
+            p.drawLine(QPointF(cx,     cy - 1), QPointF(cx + 4, cy + 5))
 
         draw_ring(p, cx, cy, mr + 7, self._main_prog, ring_c, 2.3)
 
         # ── Scroll circles ────────────────────────────────────────────────
-        for (scy, active, held, hover, prog, dt_held) in [
-            (self._su_y, self._su_active, self._su_held, self._su_hover, self._su_prog, self._su_held),
-            (self._sd_y, self._sd_active, self._sd_held, self._sd_hover, self._sd_prog, self._sd_held),
+        for (scy, active, held, hover, prog) in [
+            (self._su_y, self._su_active, self._su_held, self._su_hover, self._su_prog),
+            (self._sd_y, self._sd_active, self._sd_held, self._sd_hover, self._sd_prog),
         ]:
             is_up = (scy == self._su_y)
             if active:
                 ratio = min(held / SCROLL_ACCEL_TIME, 1.0)
                 sc = QColor(
-                    int(C_SCROLL.red()   + ratio*(C_SCROLL_A.red()   - C_SCROLL.red())),
-                    int(C_SCROLL.green() + ratio*(C_SCROLL_A.green() - C_SCROLL.green())),
-                    int(C_SCROLL.blue()  + ratio*(C_SCROLL_A.blue()  - C_SCROLL.blue())),
+                    int(C_SCROLL.red()   + ratio * (C_SCROLL_A.red()   - C_SCROLL.red())),
+                    int(C_SCROLL.green() + ratio * (C_SCROLL_A.green() - C_SCROLL.green())),
+                    int(C_SCROLL.blue()  + ratio * (C_SCROLL_A.blue()  - C_SCROLL.blue())),
                     200
                 )
             else:
-                sc = QColor(C_IDLE); sc.setAlpha(128 if hover else 88)
+                sc = QColor(C_IDLE)
+                sc.setAlpha(128 if hover else 88)
 
             draw_dot(p, cx, scy, sr, sc)
 
             ia2 = 198 if hover else 108
-            p.setPen(QPen(QColor(255,255,255,ia2), 1.7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.setPen(QPen(QColor(255, 255, 255, ia2), 1.7,
+                          Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             p.setBrush(Qt.NoBrush)
             aw = 4.5
             if is_up:
-                pts = [QPointF(cx-aw, scy+3), QPointF(cx, scy-3), QPointF(cx+aw, scy+3)]
+                pts = [QPointF(cx - aw, scy + 3),
+                       QPointF(cx,       scy - 3),
+                       QPointF(cx + aw,  scy + 3)]
             else:
-                pts = [QPointF(cx-aw, scy-3), QPointF(cx, scy+3), QPointF(cx+aw, scy-3)]
+                pts = [QPointF(cx - aw, scy - 3),
+                       QPointF(cx,       scy + 3),
+                       QPointF(cx + aw,  scy - 3)]
             p.drawPolyline(pts)
 
             if not active:
-                draw_ring(p, cx, scy, sr+5, prog, C_SCROLL, 2.0)
+                draw_ring(p, cx, scy, sr + 5, prog, C_SCROLL, 2.0)
             else:
                 angle = (time.monotonic() * 4) % (2 * math.pi)
-                dx_ = math.cos(angle) * (sr+5)
-                dy_ = math.sin(angle) * (sr+5)
-                p.setBrush(QBrush(sc)); p.setPen(Qt.NoPen)
-                p.drawEllipse(QPointF(cx+dx_, scy+dy_), 2.5, 2.5)
+                dx_ = math.cos(angle) * (sr + 5)
+                dy_ = math.sin(angle) * (sr + 5)
+                p.setBrush(QBrush(sc))
+                p.setPen(Qt.NoPen)
+                p.drawEllipse(QPointF(cx + dx_, scy + dy_), 2.5, 2.5)
 
         p.end()
 
@@ -933,10 +969,6 @@ class RightPanel(QWidget):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LeftPanel(QWidget):
-    """
-    Three buttons, always visible on left edge.
-    Double-click and drag arm on hover, then execute via cursor dwell.
-    """
     arm_double = Signal()
     arm_drag   = Signal()
     kb_toggle  = Signal()
@@ -953,38 +985,37 @@ class LeftPanel(QWidget):
         pw   = ar * 2 + 28
         ph   = ar * 6 + gap * 2 + 28
         self.setFixedSize(pw, ph)
-        self._ar  = ar
+        self._ar = ar
 
-        self._cx   = pw / 2
-        self._bcy  = [
+        self._cx  = pw / 2
+        self._bcy = [
             ph / 2 - step,
             ph / 2,
             ph / 2 + step,
         ]
 
-        self._drag_held = False
-        self._kb_open   = False
+        self._drag_held  = False
+        self._kb_open    = False
         self._active_btn = None
         self._pulse      = 0.0
         self._flash      = [0.0, 0.0, 0.0]
-
-        self._hover = [False, False, False]
-        self._prog  = [0.0,   0.0,   0.0]
+        self._hover      = [False, False, False]
+        self._prog       = [0.0,   0.0,   0.0]
 
         self._trackers = [
             DwellTracker(DWELL_EDGE),
             DwellTracker(DWELL_EDGE),
             DwellTracker(DWELL_EDGE),
         ]
-        self._trackers[0].complete.connect(lambda x,y: self.arm_double.emit())
+        self._trackers[0].complete.connect(lambda x, y: self.arm_double.emit())
         self._trackers[0].progress.connect(lambda v: self._set_prog(0, v))
         self._trackers[0].cancelled.connect(lambda: self._set_prog(0, 0))
 
-        self._trackers[1].complete.connect(lambda x,y: self.arm_drag.emit())
+        self._trackers[1].complete.connect(lambda x, y: self.arm_drag.emit())
         self._trackers[1].progress.connect(lambda v: self._set_prog(1, v))
         self._trackers[1].cancelled.connect(lambda: self._set_prog(1, 0))
 
-        self._trackers[2].complete.connect(lambda x,y: self.kb_toggle.emit())
+        self._trackers[2].complete.connect(lambda x, y: self.kb_toggle.emit())
         self._trackers[2].progress.connect(lambda v: self._set_prog(2, v))
         self._trackers[2].cancelled.connect(lambda: self._set_prog(2, 0))
 
@@ -998,17 +1029,25 @@ class LeftPanel(QWidget):
 
     def _place(self):
         scr = QApplication.primaryScreen().geometry()
-        self.move(scr.left() - LEFT_PAD,
-                  scr.center().y() - self.height() // 2)
+        # Position so the visible portion of the panel touches the left edge.
+        # LEFT_PAD is how many pixels of the panel extend off-screen (creates
+        # a natural "dock" feel with only the button faces visible).
+        self.move(
+            scr.left() - LEFT_PAD,
+            scr.center().y() - self.height() // 2
+        )
 
     def _set_prog(self, i, v):
-        self._prog[i] = v; self.update()
+        self._prog[i] = v
+        self.update()
 
     def set_drag_held(self, held):
-        self._drag_held = held; self.update()
+        self._drag_held = held
+        self.update()
 
     def set_kb_open(self, open_):
-        self._kb_open = open_; self.update()
+        self._kb_open = open_
+        self.update()
 
     def set_state(self, state):
         if state == State.ARMED_DBL:
@@ -1035,8 +1074,8 @@ class LeftPanel(QWidget):
         ly   = y - geo.y()
         ar   = self._ar
         for i, bcy in enumerate(self._bcy):
-            dist     = math.hypot(lx - self._cx, ly - bcy)
-            was      = self._hover[i]
+            dist = math.hypot(lx - self._cx, ly - bcy)
+            was  = self._hover[i]
             self._hover[i] = dist < ar + 8
             if self._hover[i]:
                 self._trackers[i].update(x, y)
@@ -1062,15 +1101,16 @@ class LeftPanel(QWidget):
         font = QFont("Consolas", 8, QFont.Medium)
         p.setFont(font)
 
-        labels   = ["⧉", "↕", "⌨"]
-        colors   = [C_ACTION, C_DRAG_HELD if self._drag_held else C_ACTION, C_KB_BTN]
-        # Keyboard button glows when open
-        if self._kb_open:
-            colors[2] = QColor(100, 200, 100, 210)
+        labels = ["⧉", "↕", "⌨"]
+        colors = [
+            C_ACTION,
+            C_DRAG_HELD if self._drag_held else C_ACTION,
+            QColor(100, 200, 100, 210) if self._kb_open else C_KB_BTN,
+        ]
 
         for i, bcy in enumerate(self._bcy):
-            prog  = self._prog[i]
-            hover = self._hover[i]
+            prog   = self._prog[i]
+            hover  = self._hover[i]
             active = (i == self._active_btn)
 
             bc = QColor(colors[i])
@@ -1079,7 +1119,10 @@ class LeftPanel(QWidget):
 
             ia = 200 if (hover or active) else 120
             p.setPen(QPen(QColor(255, 255, 255, ia)))
-            p.drawText(QRectF(cx - ar, bcy - ar, ar * 2, ar * 2), Qt.AlignCenter, labels[i])
+            p.drawText(
+                QRectF(cx - ar, bcy - ar, ar * 2, ar * 2),
+                Qt.AlignCenter, labels[i]
+            )
 
             draw_ring(p, cx, bcy, ar + 6, prog, colors[i], 2.0)
 
@@ -1093,13 +1136,13 @@ class LeftPanel(QWidget):
 class CursorRing(QWidget):
     def __init__(self):
         super().__init__()
-        self._prog  = 0.0
-        self._color = QColor(C_RING_L)
-        self._flash = 0.0
-        self._on    = False
-        self._visible_override = True  # False while in safe zone
+        self._prog             = 0.0
+        self._color            = QColor(C_RING_L)
+        self._flash            = 0.0
+        self._on               = False
+        self._visible_override = True   # False while in any safe zone
 
-        size      = (CURSOR_RING_R + 18) * 2
+        size       = (CURSOR_RING_R + 18) * 2
         self._half = size // 2
         self.setFixedSize(size, size)
         self.setWindowFlags(
@@ -1119,14 +1162,16 @@ class CursorRing(QWidget):
         self._maybe_show()
 
     def disarm(self):
-        self._on = False; self._prog = 0.0; self.hide()
+        self._on   = False
+        self._prog = 0.0
+        self.hide()
 
     def set_color(self, color):
         self._color = QColor(color)
         self.update()
 
     def set_safe(self, in_safe: bool):
-        """Hide ring while cursor is in a safe zone."""
+        """Hide the ring while the cursor is inside any safe zone."""
         self._visible_override = not in_safe
         self._maybe_show()
 
@@ -1137,12 +1182,14 @@ class CursorRing(QWidget):
             self.hide()
 
     def set_progress(self, p):
-        # Only update if we should be drawing
         if self._visible_override:
-            self._prog = p; self.update()
+            self._prog = p
+            self.update()
 
     def fire_flash(self):
-        self._flash = 1.0; self._maybe_show(); self.update()
+        self._flash = 1.0
+        self._maybe_show()
+        self.update()
 
     def follow(self, x, y):
         self.move(x - self._half, y - self._half)
@@ -1158,27 +1205,27 @@ class CursorRing(QWidget):
         p  = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w, h   = self.width(), self.height()
-        cx, cy = w/2, h/2
+        cx, cy = w / 2, h / 2
         r      = CURSOR_RING_R
         rc     = self._color
-        rect   = QRectF(cx-r, cy-r, r*2, r*2)
+        rect   = QRectF(cx - r, cy - r, r * 2, r * 2)
         p.setBrush(Qt.NoBrush)
         p.setPen(QPen(C_RING_BG, CURSOR_RING_W, Qt.SolidLine, Qt.RoundCap))
         p.drawEllipse(rect)
         if self._prog > 0:
             p.setPen(QPen(rc, CURSOR_RING_W, Qt.SolidLine, Qt.RoundCap))
-            p.drawArc(rect, 90*16, -int(self._prog * 360 * 16))
+            p.drawArc(rect, 90 * 16, -int(self._prog * 360 * 16))
         if self._flash > 0:
             fr = r + self._flash * 13
             fa = int(self._flash * 162)
             fc = QColor(rc.red(), rc.green(), rc.blue(), fa)
             p.setPen(QPen(fc, 1.4))
-            p.drawEllipse(QRectF(cx-fr, cy-fr, fr*2, fr*2))
+            p.drawEllipse(QRectF(cx - fr, cy - fr, fr * 2, fr * 2))
         p.end()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MainController
+# HID gesture listener thread
 # ─────────────────────────────────────────────────────────────────────────────
 
 def decode_hid_gesture(report) -> str | None:
@@ -1190,9 +1237,9 @@ def decode_hid_gesture(report) -> str | None:
     else:
         return None
 
-    name = GESTURE_NAMES.get(gesture_id, f"Gesture {gesture_id}")
+    name     = GESTURE_NAMES.get(gesture_id, f"Gesture {gesture_id}")
     axis_idx = gesture_data & 0x03
-    axis = GESTURE_AXES[axis_idx] if axis_idx < len(GESTURE_AXES) else ""
+    axis     = GESTURE_AXES[axis_idx] if axis_idx < len(GESTURE_AXES) else ""
     if gesture_id in (1, 3) and axis:
         axis += "+" if gesture_data & 0x80 else "-"
     return f"{name} {axis}".strip()
@@ -1200,19 +1247,21 @@ def decode_hid_gesture(report) -> str | None:
 
 class HidGestureListener(QObject):
     gesture = Signal(str)
-    status = Signal(str)
+    status  = Signal(str)
 
     def __init__(self):
         super().__init__()
-        self._stop = threading.Event()
+        self._stop   = threading.Event()
         self._thread = None
-        self._dev = None
+        self._dev    = None
 
     def start(self):
         if not HID_AVAILABLE:
             self.status.emit("hidapi unavailable")
             return
-        self._thread = threading.Thread(target=self._run, name="hid-gesture-listener", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="hid-gesture-listener", daemon=True
+        )
         self._thread.start()
 
     def stop(self):
@@ -1224,7 +1273,7 @@ class HidGestureListener(QObject):
                 pass
 
     def _open_device(self):
-        matches = hid.enumerate(HID_VID, HID_PID)
+        matches   = hid.enumerate(HID_VID, HID_PID)
         preferred = None
         for item in matches:
             product = item.get("product_string") or ""
@@ -1247,7 +1296,7 @@ class HidGestureListener(QObject):
                 self.status.emit("HID gestures connected")
                 while not self._stop.is_set():
                     report = self._dev.read(64)
-                    msg = decode_hid_gesture(report)
+                    msg    = decode_hid_gesture(report)
                     if msg:
                         self.gesture.emit(msg)
                     time.sleep(0.02)
@@ -1264,11 +1313,15 @@ class HidGestureListener(QObject):
                     self._dev = None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Gesture toast notification
+# ─────────────────────────────────────────────────────────────────────────────
+
 class GestureToast(QWidget):
     def __init__(self):
         super().__init__()
-        self._text = ""
-        self._alpha = 0.0
+        self._text   = ""
+        self._alpha  = 0.0
         self._shown_t = 0.0
         self.setFixedSize(300, 72)
         self.setWindowFlags(
@@ -1280,8 +1333,8 @@ class GestureToast(QWidget):
         self.hide()
 
     def show_message(self, text: str):
-        self._text = text
-        self._alpha = 1.0
+        self._text    = text
+        self._alpha   = 1.0
         self._shown_t = time.monotonic()
         screen = QApplication.primaryScreen()
         if screen:
@@ -1316,6 +1369,10 @@ class GestureToast(QWidget):
         p.end()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MainController
+# ─────────────────────────────────────────────────────────────────────────────
+
 class MainController(QObject):
     def __init__(self):
         super().__init__()
@@ -1325,27 +1382,32 @@ class MainController(QObject):
         self._armed_t    = None
         self._user32     = ctypes.windll.user32 if sys.platform == "win32" else None
         self._last_hwnd  = None
-        self._last_hover_pos = None
-        self._overlay_hwnds = set()
+        self._last_hover_pos  = None
+        self._overlay_hwnds   = set()
 
         self._dwell = DwellTracker(DWELL_CLICK)
         self._dwell.progress.connect(self._on_prog)
         self._dwell.complete.connect(self._on_complete)
         self._dwell.cancelled.connect(self._on_cancel)
+
         self._kb_dwell = DwellTracker(DWELL_KEY, once_only=False)
         self._kb_dwell.progress.connect(self._on_kb_prog)
         self._kb_dwell.complete.connect(self._on_kb_complete)
         self._kb_dwell.cancelled.connect(self._on_kb_cancel)
+
         self._ring_mode = None
 
-        self._right  = RightPanel()
-        self._left   = LeftPanel()
-        self._ring   = CursorRing()
-        self._kb     = ModernKeyboardManager()
+        self._right         = RightPanel()
+        self._left          = LeftPanel()
+        self._ring          = CursorRing()
+        self._kb            = KeyboardManager()   # local class — no external import
         self._gesture_toast = GestureToast()
+
         self._hid_gestures = HidGestureListener()
         self._hid_gestures.gesture.connect(self._on_hid_gesture)
-        self._hid_gestures.status.connect(lambda s: print(f"[DwellClick] {s}"))
+        self._hid_gestures.status.connect(
+            lambda s: print(f"[DwellClick] {s}")
+        )
         self._hid_gestures.start()
 
         self._right.arm_left.connect(self._on_arm_left)
@@ -1359,8 +1421,10 @@ class MainController(QObject):
 
         self._right.show()
         self._left.show()
+
         if self._user32:
-            for widget in (self._right, self._left, self._ring, self._gesture_toast):
+            for widget in (self._right, self._left,
+                           self._ring, self._gesture_toast):
                 try:
                     hwnd = int(widget.winId())
                     if hwnd:
@@ -1382,20 +1446,22 @@ class MainController(QObject):
         self._last_t = now
         x, y = QCursor.pos().x(), QCursor.pos().y()
 
-        # Timeout
-        if self._state in (State.ARMED_L, State.ARMED_R, State.ARMED_DBL, State.ARMED_DRAG, State.DRAGGING):
-            if self._armed_t and now - self._armed_t > ARMED_TIMEOUT:
+        # Auto-disarm timeout
+        if self._state in (State.ARMED_L, State.ARMED_R,
+                           State.ARMED_DBL, State.ARMED_DRAG, State.DRAGGING):
+            if self._armed_t and (now - self._armed_t) > ARMED_TIMEOUT:
                 if self._state == State.DRAGGING:
                     self._do_mouse_up()
                     self._left.set_drag_held(False)
                 self._set(State.IDLE)
                 return
 
-        kb_hover = self._kb.contains(x, y)
+        kb_hover    = self._kb.contains(x, y)
         kb_external = self._kb.uses_external_dwell() and kb_hover
-        in_safe = self._right.contains(x, y) or self._left.contains(x, y) or (kb_hover and not kb_external)
+        in_safe     = (self._right.contains(x, y)
+                       or self._left.contains(x, y)
+                       or (kb_hover and not kb_external))
 
-        # Update panels
         self._right.update_cursor(x, y)
         self._right.tick(delta)
         self._left.update_cursor(x, y)
@@ -1417,7 +1483,8 @@ class MainController(QObject):
                 if self._ring_mode == "keyboard":
                     self._ring.set_progress(0.0)
 
-            if self._state in (State.ARMED_L, State.ARMED_R, State.ARMED_DBL, State.ARMED_DRAG, State.DRAGGING):
+            if self._state in (State.ARMED_L, State.ARMED_R,
+                               State.ARMED_DBL, State.ARMED_DRAG, State.DRAGGING):
                 self._sync_ring_mode("action")
                 self._ring.set_color(ring_color_for_state(self._state))
             else:
@@ -1427,7 +1494,8 @@ class MainController(QObject):
                 if self._dwell._dwell_t is not None:
                     self._dwell.reset()
                     self._ring.set_progress(0.0)
-            elif self._state in (State.ARMED_L, State.ARMED_R, State.ARMED_DBL, State.ARMED_DRAG, State.DRAGGING):
+            elif self._state in (State.ARMED_L, State.ARMED_R,
+                                 State.ARMED_DBL, State.ARMED_DRAG, State.DRAGGING):
                 self._dwell.update(x, y)
 
         self._ring.tick(delta)
@@ -1444,44 +1512,40 @@ class MainController(QObject):
         if not self._user32:
             return
         try:
-            pt = wintypes.POINT()
-            pt.x = int(x)
-            pt.y = int(y)
-            hwnd = self._user32.WindowFromPoint(pt)
+            pt    = wintypes.POINT()
+            pt.x  = int(x)
+            pt.y  = int(y)
+            hwnd  = self._user32.WindowFromPoint(pt)
             if not hwnd:
                 return
-
-            ga_root = 2  # GA_ROOT
+            ga_root   = 2   # GA_ROOT
             root_hwnd = self._user32.GetAncestor(hwnd, ga_root)
             if not root_hwnd:
                 root_hwnd = hwnd
             if root_hwnd in self._overlay_hwnds:
                 return
-
-            self._last_hwnd = root_hwnd
+            self._last_hwnd      = root_hwnd
             self._last_hover_pos = (pt.x, pt.y)
         except Exception as e:
             print(f"[DwellClick] target capture error: {e}")
 
     def _set(self, new: State):
-        old = self._state; self._state = new
+        old = self._state
+        self._state = new
         print(f"[DwellClick] {old.name} → {new.name}")
 
         self._right.set_state(new)
         self._left.set_state(new)
 
-        if new in (State.ARMED_L, State.ARMED_R, State.ARMED_DBL, State.ARMED_DRAG):
-            self._armed_t = time.monotonic()
-            self._dwell.reset()
-            self._sync_ring_mode("action")
-            self._ring.set_color(ring_color_for_state(new))
-        elif new == State.DRAGGING:
+        if new in (State.ARMED_L, State.ARMED_R,
+                   State.ARMED_DBL, State.ARMED_DRAG, State.DRAGGING):
             self._armed_t = time.monotonic()
             self._dwell.reset()
             self._sync_ring_mode("action")
             self._ring.set_color(ring_color_for_state(new))
         elif new == State.IDLE:
-            self._armed_t = None; self._drag_phase = DragPhase.IDLE
+            self._armed_t    = None
+            self._drag_phase = DragPhase.IDLE
             self._dwell.reset()
             self._left.set_drag_held(False)
             if not self._kb.uses_external_dwell():
@@ -1502,12 +1566,15 @@ class MainController(QObject):
             color = ring_color_for_state(self._state) or C_RING_L
             self._ring.arm(color=color)
 
+    # ── State transitions ─────────────────────────────────────────────────
     def _on_arm_left(self):
         if self._state != State.DRAGGING:
             self._set(State.ARMED_L)
+
     def _on_arm_right(self):
         if self._state == State.ARMED_L:
             self._set(State.ARMED_R)
+
     def _on_disarm(self):
         self._set(State.IDLE)
 
@@ -1529,10 +1596,9 @@ class MainController(QObject):
         else:
             self._set(State.ARMED_DRAG)
 
-    def _on_prog(self, p):
-        self._ring.set_progress(p)
-    def _on_cancel(self):
-        self._ring.set_progress(0.0)
+    # ── Dwell callbacks ───────────────────────────────────────────────────
+    def _on_prog(self, p):     self._ring.set_progress(p)
+    def _on_cancel(self):      self._ring.set_progress(0.0)
 
     def _on_kb_prog(self, p):
         self._sync_ring_mode("keyboard")
@@ -1553,21 +1619,30 @@ class MainController(QObject):
             self._set(State.CLICK)
             self._right.notify_click()
             self._do_click(x, y, right=False)
-            QTimer.singleShot(int(CLICK_COOLDOWN * 1000), lambda: self._set(State.IDLE))
+            QTimer.singleShot(
+                int(CLICK_COOLDOWN * 1000),
+                lambda: self._set(State.IDLE)
+            )
             return
 
         if self._state == State.ARMED_R:
             self._set(State.CLICK)
             self._right.notify_click()
             self._do_click(x, y, right=True)
-            QTimer.singleShot(int(CLICK_COOLDOWN * 1000), lambda: self._set(State.IDLE))
+            QTimer.singleShot(
+                int(CLICK_COOLDOWN * 1000),
+                lambda: self._set(State.IDLE)
+            )
             return
 
         if self._state == State.ARMED_DBL:
             self._set(State.CLICK)
             self._left.notify_click(LeftPanel._BTN_DBL)
             self._do_dbl_click(x, y)
-            QTimer.singleShot(int(CLICK_COOLDOWN * 1000), lambda: self._set(State.IDLE))
+            QTimer.singleShot(
+                int(CLICK_COOLDOWN * 1000),
+                lambda: self._set(State.IDLE)
+            )
             return
 
         if self._state == State.ARMED_DRAG:
@@ -1601,68 +1676,85 @@ class MainController(QObject):
             self._kb.show_near(x, y)
             self._left.set_kb_open(True)
 
+    # ── Mouse actions ─────────────────────────────────────────────────────
     def _do_click(self, x, y, right):
         self._store_target_window(x, y)
         kind = "RIGHT" if right else "LEFT"
         if not PYNPUT_AVAILABLE or not self._mouse:
-            print(f"[DwellClick] {kind} CLICK ({x:.0f},{y:.0f}) [sim]"); return
+            print(f"[DwellClick] {kind} CLICK ({x:.0f},{y:.0f}) [sim]")
+            return
         try:
             self._mouse.click(Button.right if right else Button.left)
-        except Exception as e: print(f"[DwellClick] {e}")
+        except Exception as e:
+            print(f"[DwellClick] {e}")
 
     def _do_dbl_click(self, x, y):
         self._store_target_window(x, y)
         if not PYNPUT_AVAILABLE or not self._mouse:
-            print(f"[DwellClick] DBL-CLICK ({x:.0f},{y:.0f}) [sim]"); return
+            print(f"[DwellClick] DBL-CLICK ({x:.0f},{y:.0f}) [sim]")
+            return
         try:
             self._mouse.click(Button.left, 2)
-        except Exception as e: print(f"[DwellClick] {e}")
+        except Exception as e:
+            print(f"[DwellClick] {e}")
 
     def _do_mouse_down(self):
         x, y = QCursor.pos().x(), QCursor.pos().y()
         self._store_target_window(x, y)
         if not PYNPUT_AVAILABLE or not self._mouse:
-            print("[DwellClick] MOUSE DOWN [sim]"); return
-        try: self._mouse.press(Button.left)
-        except Exception as e: print(f"[DwellClick] {e}")
+            print("[DwellClick] MOUSE DOWN [sim]")
+            return
+        try:
+            self._mouse.press(Button.left)
+        except Exception as e:
+            print(f"[DwellClick] {e}")
 
     def _do_mouse_up(self):
         if not PYNPUT_AVAILABLE or not self._mouse:
-            print("[DwellClick] MOUSE UP [sim]"); return
-        try: self._mouse.release(Button.left)
-        except Exception as e: print(f"[DwellClick] {e}")
+            print("[DwellClick] MOUSE UP [sim]")
+            return
+        try:
+            self._mouse.release(Button.left)
+        except Exception as e:
+            print(f"[DwellClick] {e}")
 
     def _do_scroll(self, amount):
-        # Prefer scrolling the last real window hovered by the cursor.
+        # Prefer posting WM_MOUSEWHEEL directly to the last real window
         if self._user32 and self._last_hwnd:
             try:
                 wm_mousewheel = 0x020A
-                delta = int(-amount * 120)
-                delta_word = ctypes.c_ushort(delta & 0xFFFF).value
-                w_param = delta_word << 16
+                delta         = int(-amount * 120)
+                delta_word    = ctypes.c_ushort(delta & 0xFFFF).value
+                w_param       = delta_word << 16
 
                 if self._last_hover_pos:
                     cx, cy = self._last_hover_pos
                 else:
                     rect = wintypes.RECT()
-                    if not self._user32.GetWindowRect(self._last_hwnd, ctypes.byref(rect)):
+                    if not self._user32.GetWindowRect(
+                            self._last_hwnd, ctypes.byref(rect)):
                         raise OSError("GetWindowRect failed")
-                    cx = (rect.left + rect.right) // 2
-                    cy = (rect.top + rect.bottom) // 2
+                    cx = (rect.left + rect.right)  // 2
+                    cy = (rect.top  + rect.bottom) // 2
 
-                x_word = ctypes.c_ushort(cx & 0xFFFF).value
-                y_word = ctypes.c_ushort(cy & 0xFFFF).value
+                x_word  = ctypes.c_ushort(cx & 0xFFFF).value
+                y_word  = ctypes.c_ushort(cy & 0xFFFF).value
                 l_param = (y_word << 16) | x_word
 
-                self._user32.PostMessageW(self._last_hwnd, wm_mousewheel, w_param, l_param)
+                self._user32.PostMessageW(
+                    self._last_hwnd, wm_mousewheel, w_param, l_param
+                )
                 return
             except Exception as e:
                 print(f"[DwellClick] targeted scroll failed: {e}")
 
         if not PYNPUT_AVAILABLE or not self._mouse:
-            print(f"[DwellClick] SCROLL {amount:+d} [sim]"); return
-        try: self._mouse.scroll(0, -amount)
-        except Exception as e: print(f"[DwellClick] scroll: {e}")
+            print(f"[DwellClick] SCROLL {amount:+d} [sim]")
+            return
+        try:
+            self._mouse.scroll(0, -amount)
+        except Exception as e:
+            print(f"[DwellClick] scroll: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1696,12 +1788,14 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    ctrl = MainController()  # noqa
+    ctrl = MainController()
     app.aboutToQuit.connect(ctrl.stop)
 
     import signal
     signal.signal(signal.SIGINT, lambda *_: app.quit())
-    pulse = QTimer(); pulse.start(250); pulse.timeout.connect(lambda: None)
+    pulse = QTimer()
+    pulse.start(250)
+    pulse.timeout.connect(lambda: None)
 
     sys.exit(app.exec())
 

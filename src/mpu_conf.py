@@ -1,21 +1,44 @@
 #!/usr/bin/env python3
 """
-ESP32 MPU Mouse — Axis Calibration GUI (BLE Version)
-Requirements: pip install bleak
+ESP32 MPU Mouse — Configuration GUI
+Communicates exclusively via USB HID feature reports (hidapi).
+No BLE, no serial dependency.
+
+Requirements: pip install hid
 """
 
-import json, threading, time, asyncio, struct
+import json
+import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
-import serial, serial.tools.list_ports
+
 try:
     import hid
-except ImportError:
+except ImportError as e:
     hid = None
+    HID_IMPORT_ERROR = str(e)
+else:
+    HID_IMPORT_ERROR = None
+
+
+def hid_import_diagnostic():
+    if not HID_IMPORT_ERROR:
+        return "hid is not available in this Python environment.\nRun: pip install hid"
+    return (
+        "Python found the hid package, but failed to load its native HID library.\n"
+        "On Windows this usually means hidapi.dll (or libhidapi-0.dll) is missing from PATH.\n\n"
+        f"Import error:\n{HID_IMPORT_ERROR}\n\n"
+        "Fix options:\n"
+        "1) Use Python 3.12 and reinstall: pip install --force-reinstall hid\n"
+        "2) Install the HIDAPI runtime DLL and ensure it is on PATH"
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
-AXIS_NAMES  = ["Yaw (0)", "Pitch (1)", "Roll (2)"]
-SAVE_FILE   = "mpu_config.json"
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+AXIS_NAMES = ["Yaw (0)", "Pitch (1)", "Roll (2)"]
+SAVE_FILE  = "mpu_config.json"
 
 DEFAULT_CFG = {
     "cursorXAxis": 0, "cursorYAxis": 2, "clickAxis": 1,
@@ -29,25 +52,23 @@ DEFAULT_CFG = {
     "enableDoubleTilt": True, "enableCircle": True,
 }
 
-HID_VID = 0xE502
-HID_PID = 0xA111
+HID_VID     = 0xE502
+HID_PID     = 0xA111
 HID_PRODUCT = "ESP32 MPU Mouse"
+
 REPORT_ID_GESTURE = 2
 REPORT_ID_FEATURE = 3
-FEATURE_PAGE_BASIC = 0
-FEATURE_PAGE_GAINS = 1
-FEATURE_PAGE_FLICK = 2
-FEATURE_PAGE_OTHER_GESTURES = 3
-FEATURE_PAGE_SELECT = 0x7F
 
-GESTURE_NAMES = {
-    1: "Flick",
-    2: "Shake",
-    3: "DoubleTilt",
-    4: "Circle",
-}
-AXIS_SHORT = ["YAW", "PITCH", "ROLL", ""]
+FEATURE_PAGE_BASIC           = 0
+FEATURE_PAGE_GAINS           = 1
+FEATURE_PAGE_FLICK           = 2
+FEATURE_PAGE_OTHER_GESTURES  = 3
+FEATURE_PAGE_SELECT          = 0x7F
 
+GESTURE_NAMES = {1: "Flick", 2: "Shake", 3: "DoubleTilt", 4: "Circle"}
+AXIS_SHORT    = ["YAW", "PITCH", "ROLL", ""]
+
+# ─── Colour palette ───────────────────────────────────────────────────────────
 C = {
     "bg0":    "#0d0f12", "bg1": "#13161b", "bg2": "#1a1e25", "bg3": "#222733",
     "border": "#2a3040", "border2": "#3a4558",
@@ -55,68 +76,70 @@ C = {
     "green":  "#00e676", "amber": "#ffab40", "red": "#ff5252", "purple": "#b388ff",
     "text0":  "#e8ecf4", "text1": "#8892a4", "text2": "#4a5568",
 }
-FONT_MONO  = ("Consolas", 9)
-FONT_TINY  = ("Consolas", 8)
-FONT_HEAD  = ("Segoe UI", 9, "bold")
+FONT_MONO = ("Consolas", 9)
+FONT_TINY = ("Consolas", 8)
+FONT_HEAD = ("Segoe UI", 9, "bold")
 
 
-def _u8_scaled(value, scale=10.0):
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature report encode / decode  (must match firmware exactly)
+# ─────────────────────────────────────────────────────────────────────────────
+def _u8(value, scale=10.0):
     return max(0, min(255, int(round(float(value) * scale))))
 
-
-def _u16_scaled(value, scale=1.0):
+def _u16(value, scale=1.0):
     return max(0, min(65535, int(round(float(value) * scale))))
 
+def _put16(buf, idx, v):
+    v = int(v) & 0xFFFF
+    buf[idx]     = v & 0xFF
+    buf[idx + 1] = (v >> 8) & 0xFF
 
-def _put_u16(buf, idx, value):
-    value = int(value) & 0xFFFF
-    buf[idx] = value & 0xFF
-    buf[idx + 1] = (value >> 8) & 0xFF
-
-
-def _get_u16(buf, idx):
+def _get16(buf, idx):
     return int(buf[idx]) | (int(buf[idx + 1]) << 8)
 
 
 def cfg_to_feature_pages(cfg):
     pages = []
+
     p = [0] * 8
     p[0] = FEATURE_PAGE_BASIC
     p[1] = ((int(cfg.get("cursorXAxis", 0)) & 0x03)
             | ((int(cfg.get("cursorYAxis", 2)) & 0x03) << 2)
-            | ((int(cfg.get("clickAxis", 1)) & 0x03) << 4))
-    p[2] = ((0x01 if cfg.get("invertX", False) else 0)
-            | (0x02 if cfg.get("invertY", False) else 0)
-            | (0x04 if cfg.get("invertClick", False) else 0)
-            | (0x10 if cfg.get("enableFlick", True) else 0)
-            | (0x20 if cfg.get("enableShake", True) else 0)
+            | ((int(cfg.get("clickAxis",   1)) & 0x03) << 4))
+    p[2] = ((0x01 if cfg.get("invertX",        False) else 0)
+            | (0x02 if cfg.get("invertY",       False) else 0)
+            | (0x04 if cfg.get("invertClick",   False) else 0)
+            | (0x10 if cfg.get("enableFlick",   True)  else 0)
+            | (0x20 if cfg.get("enableShake",   True)  else 0)
             | (0x40 if cfg.get("enableDoubleTilt", True) else 0)
-            | (0x80 if cfg.get("enableCircle", True) else 0))
-    p[3] = _u8_scaled(cfg.get("deadzoneX", 1.5))
-    p[4] = _u8_scaled(cfg.get("deadzoneY", 1.5))
-    p[5] = _u8_scaled(cfg.get("deadzoneClick", 2.0))
-    p[6] = _u8_scaled(cfg.get("tiltThreshDeg", cfg.get("clickThreshDeg", 30.0)))
+            | (0x80 if cfg.get("enableCircle",  True)  else 0))
+    p[3] = _u8(cfg.get("deadzoneX",     1.5))
+    p[4] = _u8(cfg.get("deadzoneY",     1.5))
+    p[5] = _u8(cfg.get("deadzoneClick", 2.0))
+    p[6] = _u8(cfg.get("tiltThreshDeg", 30.0))
     pages.append(p)
 
     p = [0] * 8
     p[0] = FEATURE_PAGE_GAINS
-    _put_u16(p, 1, _u16_scaled(cfg.get("gainX", 0.3), 100.0))
-    _put_u16(p, 3, _u16_scaled(cfg.get("gainY", 0.3), 100.0))
+    _put16(p, 1, _u16(cfg.get("gainX", 0.3), 100.0))
+    _put16(p, 3, _u16(cfg.get("gainY", 0.3), 100.0))
     pages.append(p)
 
     p = [0] * 8
     p[0] = FEATURE_PAGE_FLICK
-    _put_u16(p, 1, _u16_scaled(cfg.get("flickVelThresh", 120.0)))
-    p[3] = _u8_scaled(cfg.get("flickReturnDeg", 8.0))
-    _put_u16(p, 4, _u16_scaled(cfg.get("flickConfirmMs", 300.0)))
+    _put16(p, 1, _u16(cfg.get("flickVelThresh", 120.0)))
+    p[3] = _u8(cfg.get("flickReturnDeg", 8.0))
+    _put16(p, 4, _u16(cfg.get("flickConfirmMs", 300.0)))
     pages.append(p)
 
     p = [0] * 8
     p[0] = FEATURE_PAGE_OTHER_GESTURES
-    _put_u16(p, 1, _u16_scaled(cfg.get("shakeVelThresh", 60.0)))
-    p[3] = _u8_scaled(cfg.get("doubleTiltDeg", 25.0))
-    _put_u16(p, 4, _u16_scaled(cfg.get("circleMinSpeed", 20.0)))
+    _put16(p, 1, _u16(cfg.get("shakeVelThresh", 60.0)))
+    p[3] = _u8(cfg.get("doubleTiltDeg",  25.0))
+    _put16(p, 4, _u16(cfg.get("circleMinSpeed", 20.0)))
     pages.append(p)
+
     return pages
 
 
@@ -125,176 +148,115 @@ def merge_feature_page(cfg, payload):
         return
     page = payload[0]
     if page == FEATURE_PAGE_BASIC:
-        packed_axes = payload[1]
-        flags = payload[2]
-        cfg["cursorXAxis"] = packed_axes & 0x03
-        cfg["cursorYAxis"] = (packed_axes >> 2) & 0x03
-        cfg["clickAxis"] = (packed_axes >> 4) & 0x03
-        cfg["invertX"] = bool(flags & 0x01)
-        cfg["invertY"] = bool(flags & 0x02)
-        cfg["invertClick"] = bool(flags & 0x04)
-        cfg["enableFlick"] = bool(flags & 0x10)
-        cfg["enableShake"] = bool(flags & 0x20)
-        cfg["enableDoubleTilt"] = bool(flags & 0x40)
-        cfg["enableCircle"] = bool(flags & 0x80)
-        cfg["deadzoneX"] = payload[3] / 10.0
-        cfg["deadzoneY"] = payload[4] / 10.0
-        cfg["deadzoneClick"] = payload[5] / 10.0
-        cfg["tiltThreshDeg"] = payload[6] / 10.0
-        cfg["clickThreshDeg"] = cfg["tiltThreshDeg"]
+        ax = payload[1]
+        fl = payload[2]
+        cfg["cursorXAxis"]      = ax & 0x03
+        cfg["cursorYAxis"]      = (ax >> 2) & 0x03
+        cfg["clickAxis"]        = (ax >> 4) & 0x03
+        cfg["invertX"]          = bool(fl & 0x01)
+        cfg["invertY"]          = bool(fl & 0x02)
+        cfg["invertClick"]      = bool(fl & 0x04)
+        cfg["enableFlick"]      = bool(fl & 0x10)
+        cfg["enableShake"]      = bool(fl & 0x20)
+        cfg["enableDoubleTilt"] = bool(fl & 0x40)
+        cfg["enableCircle"]     = bool(fl & 0x80)
+        cfg["deadzoneX"]        = payload[3] / 10.0
+        cfg["deadzoneY"]        = payload[4] / 10.0
+        cfg["deadzoneClick"]    = payload[5] / 10.0
+        cfg["tiltThreshDeg"]    = payload[6] / 10.0
     elif page == FEATURE_PAGE_GAINS:
-        cfg["gainX"] = _get_u16(payload, 1) / 100.0
-        cfg["gainY"] = _get_u16(payload, 3) / 100.0
+        cfg["gainX"] = _get16(payload, 1) / 100.0
+        cfg["gainY"] = _get16(payload, 3) / 100.0
     elif page == FEATURE_PAGE_FLICK:
-        cfg["flickVelThresh"] = float(_get_u16(payload, 1))
+        cfg["flickVelThresh"] = float(_get16(payload, 1))
         cfg["flickReturnDeg"] = payload[3] / 10.0
-        cfg["flickConfirmMs"] = float(_get_u16(payload, 4))
+        cfg["flickConfirmMs"] = float(_get16(payload, 4))
     elif page == FEATURE_PAGE_OTHER_GESTURES:
-        cfg["shakeVelThresh"] = float(_get_u16(payload, 1))
-        cfg["doubleTiltDeg"] = payload[3] / 10.0
-        cfg["circleMinSpeed"] = float(_get_u16(payload, 4))
+        cfg["shakeVelThresh"] = float(_get16(payload, 1))
+        cfg["doubleTiltDeg"]  = payload[3] / 10.0
+        cfg["circleMinSpeed"] = float(_get16(payload, 4))
 
 
 def decode_gesture_report(report):
     data = list(report)
     if len(data) >= 3 and data[0] == REPORT_ID_GESTURE:
-        gesture_id, gesture_data = data[1], data[2]
+        gid, gdata = data[1], data[2]
     elif len(data) >= 2:
-        gesture_id, gesture_data = data[0], data[1]
+        gid, gdata = data[0], data[1]
     else:
         return None
-
-    name = GESTURE_NAMES.get(gesture_id, f"Gesture{gesture_id}")
-    axis_idx = gesture_data & 0x03
-    axis = AXIS_SHORT[axis_idx] if axis_idx < len(AXIS_SHORT) else ""
-    if gesture_id in (1, 3) and axis:
-        axis += "+" if (gesture_data & 0x80) else "-"
+    name     = GESTURE_NAMES.get(gid, f"Gesture{gid}")
+    axis_idx = gdata & 0x03
+    axis     = AXIS_SHORT[axis_idx] if axis_idx < len(AXIS_SHORT) else ""
+    if gid in (1, 3) and axis:
+        axis += "+" if (gdata & 0x80) else "-"
     return {"gesture": name, "axis": axis}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-class BleConfigThread(threading.Thread):
-    def __init__(self, address, on_data, on_gesture, on_status):
-        super().__init__(daemon=True)
-        self.address = address
-        self.on_data = on_data
-        self.on_gesture = on_gesture
-        self.on_status = on_status
-        self._stop = asyncio.Event()
-        self.client = None
-        self.connected = False
-        self._loop = None
-        self._write_queue = asyncio.Queue()
-
-    def run(self):
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._run_async())
-
-    async def _run_async(self):
-        def raw_data_handler(sender, data):
-            if len(data) == 19 and data[0] == 0x01:
-                # Unpack 9 int16s (little endian)
-                vals = struct.unpack("<9h", data[1:])
-                # We only need yaw, pitch, roll which are the last 3, scaled by 100
-                yaw, pitch, roll = vals[6] / 100.0, vals[7] / 100.0, vals[8] / 100.0
-                self.on_data([yaw, pitch, roll])
-
-        def gesture_handler(sender, data):
-            try:
-                msg = json.loads(data.decode(errors="ignore"))
-                self.on_gesture(msg)
-            except json.JSONDecodeError:
-                pass
-
-        def config_handler(sender, data):
-            try:
-                msg = json.loads(data.decode(errors="ignore"))
-                if "ack" in msg or "pong" in msg:
-                    self.on_status("ack" if "ack" in msg else "connected")
-            except json.JSONDecodeError:
-                pass
-
-        def on_disconnect(client):
-            self.connected = False
-            self.on_status("disconnected")
-            self._stop.set()
-
-        try:
-            self.client = BleakClient(self.address, disconnected_callback=on_disconnect)
-            await self.client.connect()
-            self.connected = True
-            self.on_status("connected")
-
-            await self.client.start_notify(RAW_DATA_CHAR_UUID, raw_data_handler)
-            await self.client.start_notify(GESTURE_CHAR_UUID, gesture_handler)
-            await self.client.start_notify(CONFIG_CHAR_UUID, config_handler)
-
-            # Send ping
-            await self.client.write_gatt_char(CONFIG_CHAR_UUID, b'{"ping":1}')
-
-            while not self._stop.is_set():
-                try:
-                    # Wait for items to write, timeout to check stop event
-                    payload = await asyncio.wait_for(self._write_queue.get(), timeout=0.1)
-                    await self.client.write_gatt_char(CONFIG_CHAR_UUID, (json.dumps(payload)).encode())
-                except asyncio.TimeoutError:
-                    pass
-                except Exception as e:
-                    self.on_status(f"error:{e}")
-
-        except Exception as e:
-            self.on_status(f"error:{e}")
-        finally:
-            if self.client and self.client.is_connected:
-                await self.client.disconnect()
-            self.connected = False
-
-    def send(self, payload):
-        if self.ser and self.ser.is_open:
-            self.ser.write((json.dumps(payload) + "\n").encode())
-
-    def stop(self):
-        self._stop.set()
-
-
+# HID thread — reads gesture reports + exposes feature report R/W
 # ─────────────────────────────────────────────────────────────────────────────
 class HIDThread(threading.Thread):
     def __init__(self, on_gesture, on_status):
         super().__init__(daemon=True)
-        self.on_gesture, self.on_status = on_gesture, on_status
-        self._stop = threading.Event()
-        self.dev = None
-        self.connected = False
-        self._lock = threading.Lock()
+        self.on_gesture = on_gesture
+        self.on_status  = on_status
+        self._stop      = threading.Event()
+        self.dev_gesture = None
+        self.dev_feature = None
+        self.connected  = False
+        self._lock      = threading.Lock()
 
     def _open_device(self):
         if hid is None:
-            raise RuntimeError("hidapi is not installed")
-        matches = hid.enumerate(HID_VID, HID_PID)
-        preferred = None
+            raise RuntimeError(hid_import_diagnostic())
+        matches = hid.enumerate()
+        
+        path_gesture = None
+        path_feature = None
+        
         for item in matches:
-            product = item.get("product_string") or ""
-            if HID_PRODUCT.lower() in product.lower():
-                preferred = item
-                break
-        if preferred is None and matches:
-            preferred = matches[0]
-        if preferred is None:
-            raise RuntimeError("ESP32 HID device not found")
-        dev = hid.device()
-        dev.open_path(preferred["path"])
-        dev.set_nonblocking(True)
-        return dev
+            if HID_PRODUCT.lower() in (item.get("product_string") or "").lower():
+                # On Windows, HID collections are split into multiple device paths.
+                if item.get("usage_page") == 65280 and item.get("usage") == 1:
+                    path_gesture = item["path"]
+                elif item.get("usage_page") == 65280 and item.get("usage") == 16:
+                    path_feature = item["path"]
+                else:
+                    if not path_gesture: path_gesture = item["path"]
+                    if not path_feature: path_feature = item["path"]
+
+        if not path_gesture or not path_feature:
+            raise RuntimeError(
+                "ESP32 MPU Mouse not found.\n"
+                "Make sure it is paired and connected via Bluetooth."
+            )
+            
+        def _open_path(path):
+            if hasattr(hid, 'Device'):
+                d = hid.Device(path=path)
+                d.nonblocking = True
+                return d
+            else:
+                d = hid.device()
+                d.open_path(path)
+                d.set_nonblocking(True)
+                return d
+
+        self.dev_gesture = _open_path(path_gesture)
+        if path_feature == path_gesture:
+            self.dev_feature = self.dev_gesture
+        else:
+            self.dev_feature = _open_path(path_feature)
 
     def run(self):
         try:
-            self.dev = self._open_device()
+            self._open_device()
             self.connected = True
             self.on_status("connected")
             while not self._stop.is_set():
                 with self._lock:
-                    report = self.dev.read(64)
+                    report = self.dev_gesture.read(64)
                 if report:
                     msg = decode_gesture_report(report)
                     if msg:
@@ -304,37 +266,43 @@ class HIDThread(threading.Thread):
             self.on_status(f"error:{e}")
         finally:
             self.connected = False
-            if self.dev:
-                try:
-                    self.dev.close()
-                except Exception:
-                    pass
+            try:
+                if self.dev_gesture: self.dev_gesture.close()
+                if self.dev_feature and self.dev_feature != self.dev_gesture:
+                    self.dev_feature.close()
+            except Exception:
+                pass
 
     def send_feature(self, payload8):
-        if not self.connected or not self.dev:
-            raise RuntimeError("HID device is not connected")
+        if not self.connected or not self.dev_feature:
+            raise RuntimeError("Device not connected")
         if len(payload8) != 8:
-            raise ValueError("feature payload must be 8 bytes")
+            raise ValueError("Feature payload must be exactly 8 bytes")
         with self._lock:
-            return self.dev.send_feature_report(bytes([REPORT_ID_FEATURE] + list(payload8)))
+            return self.dev_feature.send_feature_report(
+                bytes([REPORT_ID_FEATURE] + list(payload8))
+            )
 
     def get_feature(self, page):
         self.send_feature([FEATURE_PAGE_SELECT, page, 0, 0, 0, 0, 0, 0])
         time.sleep(0.03)
         with self._lock:
-            data = list(self.dev.get_feature_report(REPORT_ID_FEATURE, 9))
+            data = list(self.dev_feature.get_feature_report(REPORT_ID_FEATURE, 9))
         if len(data) >= 9 and data[0] == REPORT_ID_FEATURE:
             return data[1:9]
         if len(data) >= 8:
             return data[:8]
-        raise RuntimeError("short feature report")
+        raise RuntimeError("Short feature report received")
 
     def stop(self):
         self._stop.set()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Custom widgets
+# ─────────────────────────────────────────────────────────────────────────────
 class PrecisionSlider(tk.Frame):
-    """Slider + spinbox for coarse drag AND precise keyboard/type tuning."""
+    """Horizontal slider + spinbox for coarse drag and precise keyboard entry."""
 
     def __init__(self, parent, from_, to, resolution, initial=None,
                  width=200, on_change=None, **kw):
@@ -375,8 +343,10 @@ class PrecisionSlider(tk.Frame):
 
     def _validate(self, P):
         if P in ("", "-", "."): return True
-        try: float(P); return True
-        except ValueError: return False
+        try:
+            float(P); return True
+        except ValueError:
+            return False
 
     def _on_var(self, *_):
         if self._updating: return
@@ -385,17 +355,19 @@ class PrecisionSlider(tk.Frame):
             v = round(float(self._var.get()), self._dec())
             v = max(self._from, min(self._to, v))
             if self._cb: self._cb(v)
-        except (tk.TclError, ValueError): pass
-        finally: self._updating = False
+        except (tk.TclError, ValueError):
+            pass
+        finally:
+            self._updating = False
 
     def get(self):
-        try: return round(float(self._var.get()), self._dec())
+        try:   return round(float(self._var.get()), self._dec())
         except: return self._from
 
     def set(self, v):
         self._var.set(round(float(v), self._dec()))
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 class DeadzoneViz(tk.Canvas):
     W = H = 80
 
@@ -433,14 +405,13 @@ class DeadzoneViz(tk.Canvas):
                          fill="#003320" if not inside else C["bg3"], outline="")
         self.create_oval(dot_x-3, cy-3, dot_x+3, cy+3, fill=col, outline="")
         sign = "+" if self._value >= 0 else ""
-        self.create_text(cx, self.H-5,
-                         text=f"{sign}{self._value:.1f}°",
+        self.create_text(cx, self.H-5, text=f"{sign}{self._value:.1f}°",
                          fill=C["text1"], font=FONT_TINY)
         self.create_text(cx, 7, text=self._label,
                          fill=C["accent"] if not inside else C["text2"],
                          font=FONT_TINY)
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 class AxisBar(tk.Canvas):
     W, H = 230, 18
 
@@ -467,7 +438,8 @@ class AxisBar(tk.Canvas):
         norm  = max(-1.0, min(1.0, self._value / 90.0))
         bw    = int(abs(norm) * (cx - 4))
         inside = abs(self._value) <= self._dead
-        col = C["text2"] if inside else (C["green"] if abs(self._value) < 45 else C["amber"])
+        col = (C["text2"] if inside
+               else (C["green"] if abs(self._value) < 45 else C["amber"]))
         if norm >= 0:
             self.create_rectangle(cx, cy-3, cx+bw, cy+3, fill=col, outline="")
         else:
@@ -478,11 +450,12 @@ class AxisBar(tk.Canvas):
         self.create_text(self.W-3, cy, text=f"{sign}{self._value:6.1f}°",
                          anchor="e", fill=C["text0"], font=FONT_MONO)
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 class Card(tk.Frame):
     def __init__(self, parent, title, **kw):
         super().__init__(parent, bg=C["bg1"],
-                         highlightthickness=1, highlightbackground=C["border"], **kw)
+                         highlightthickness=1,
+                         highlightbackground=C["border"], **kw)
         hdr = tk.Frame(self, bg=C["bg0"])
         hdr.pack(fill="x")
         tk.Frame(hdr, bg=C["accent"], width=3).pack(side="left", fill="y")
@@ -491,6 +464,9 @@ class Card(tk.Frame):
         self.body = tk.Frame(self, bg=C["bg1"])
         self.body.pack(fill="both", expand=True, padx=10, pady=8)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main application
 # ─────────────────────────────────────────────────────────────────────────────
 class App(tk.Tk):
     def __init__(self):
@@ -499,11 +475,9 @@ class App(tk.Tk):
         self.configure(bg=C["bg0"])
         self.minsize(880, 620)
 
-        self.cfg    = dict(DEFAULT_CFG)
-        self.serial = None
+        self.cfg        = dict(DEFAULT_CFG)
         self.hid_thread = None
-        self.axes   = [0.0, 0.0, 0.0]
-        self.device_addresses = {}
+        self.axes       = [0.0, 0.0, 0.0]
 
         self._load_config()
         self._setup_style()
@@ -520,41 +494,37 @@ class App(tk.Tk):
                     foreground=C["text0"], selectbackground=C["accent2"],
                     bordercolor=C["border"], arrowcolor=C["text1"],
                     relief="flat", padding=(4, 3))
-        s.map("TCombobox", fieldbackground=[("readonly", C["bg3"])],
+        s.map("TCombobox",
+              fieldbackground=[("readonly", C["bg3"])],
               foreground=[("readonly", C["text0"])])
-        s.configure("Vert.TScrollbar", background=C["bg2"],
-                    troughcolor=C["bg3"], arrowcolor=C["text1"], relief="flat")
 
-    # ── Build ─────────────────────────────────────────────────────────────────
+    # ── Build UI ──────────────────────────────────────────────────────────────
     def _build_ui(self):
         # Top bar
         top = tk.Frame(self, bg=C["bg0"],
                        highlightthickness=1, highlightbackground=C["border"])
         top.pack(fill="x")
-        top.columnconfigure(4, weight=1)
 
         tk.Label(top, text="MPU MOUSE  CONFIG",
                  bg=C["bg0"], fg=C["accent"],
-                 font=("Consolas", 11, "bold"), padx=14, pady=8).grid(row=0, column=0)
-        tk.Frame(top, bg=C["border"], width=1).grid(row=0, column=1, sticky="ns", pady=4)
+                 font=("Consolas", 11, "bold"), padx=14, pady=8).pack(side="left")
 
-        tk.Label(top, text="DEVICE", bg=C["bg0"], fg=C["text1"],
-                 font=FONT_TINY, padx=8).grid(row=0, column=2)
-        self.device_var = tk.StringVar()
-        self.device_cb  = ttk.Combobox(top, textvariable=self.device_var,
-                                       width=25, state="readonly")
-        self.device_cb.grid(row=0, column=3, padx=(0, 4))
-        self._btn(top, "SCAN", self._scan_ble).grid(row=0, column=4, sticky="w", padx=2)
-        self._btn(top, "CONNECT", self._connect, accent=True).grid(
-            row=0, column=5, padx=6)
+        tk.Frame(top, bg=C["border"], width=1).pack(
+            side="left", fill="y", pady=4)
 
-        self.led = tk.Canvas(top, width=10, height=10, bg=C["bg0"], highlightthickness=0)
-        self.led.grid(row=0, column=6, padx=(12, 3))
+        # Connect button — the only connection control needed
+        self._btn(top, "CONNECT", self._connect, accent=True).pack(
+            side="left", padx=10)
+
+        self.led = tk.Canvas(top, width=10, height=10,
+                             bg=C["bg0"], highlightthickness=0)
+        self.led.pack(side="left", padx=(4, 2))
         self._led = self.led.create_oval(1, 1, 9, 9, fill=C["red"], outline="")
 
-        self.status_lbl = tk.Label(top, text="DISCONNECTED", bg=C["bg0"],
-                                   fg=C["red"], font=("Consolas", 8, "bold"), padx=8)
-        self.status_lbl.grid(row=0, column=7, sticky="e")
+        self.status_lbl = tk.Label(top, text="DISCONNECTED",
+                                   bg=C["bg0"], fg=C["red"],
+                                   font=("Consolas", 8, "bold"), padx=8)
+        self.status_lbl.pack(side="left")
 
         # Body
         body = tk.Frame(self, bg=C["bg0"])
@@ -568,23 +538,21 @@ class App(tk.Tk):
         left.grid( row=0, column=0, sticky="nsew", padx=(0, 4))
         right.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
         left.columnconfigure(0, weight=1)
-        for r in range(3): left.rowconfigure(r, weight=[0,0,1][r])
+        for r in range(3): left.rowconfigure(r, weight=[0, 0, 1][r])
         right.columnconfigure(0, weight=1)
         right.rowconfigure(0, weight=0)
         right.rowconfigure(1, weight=1)
 
-        # Left cards
-        Card(left, "AXIS MAPPING").grid(row=0, column=0, sticky="ew", pady=(0,5))
+        Card(left, "AXIS MAPPING").grid(row=0, column=0, sticky="ew", pady=(0, 5))
         self._build_mapping(left.winfo_children()[-1].body)
 
-        Card(left, "DEADZONES  &  SENSITIVITY").grid(row=1, column=0, sticky="ew", pady=(0,5))
+        Card(left, "DEADZONES  &  SENSITIVITY").grid(row=1, column=0, sticky="ew", pady=(0, 5))
         self._build_deadzones(left.winfo_children()[-1].body)
 
         Card(left, "GESTURE THRESHOLDS").grid(row=2, column=0, sticky="nsew")
         self._build_gestures(left.winfo_children()[-1].body)
 
-        # Right cards
-        Card(right, "LIVE MONITOR").grid(row=0, column=0, sticky="ew", pady=(0,5))
+        Card(right, "LIVE MONITOR").grid(row=0, column=0, sticky="ew", pady=(0, 5))
         self._build_live(right.winfo_children()[-1].body)
 
         Card(right, "GESTURE LOG").grid(row=1, column=0, sticky="nsew")
@@ -597,27 +565,29 @@ class App(tk.Tk):
         inner = tk.Frame(bot, bg=C["bg0"])
         inner.pack(side="right", padx=10, pady=6)
         for text, cmd, acc in [
-            ("APPLY",           self._apply,         True),
-            ("SAVE",            self._save_config,   False),
-            ("LOAD",            self._load_and_apply,False),
-            ("RESET DEFAULTS",  self._reset_defaults,False),
+            ("APPLY",          self._apply,          True),
+            ("SAVE",           self._save_config,    False),
+            ("LOAD FROM DEVICE", self._load_and_apply, False),
+            ("RESET DEFAULTS", self._reset_defaults, False),
         ]:
             self._btn(inner, text, cmd, accent=acc).pack(side="left", padx=3)
 
     # ── Section builders ──────────────────────────────────────────────────────
     def _build_mapping(self, p):
         self.axis_vars, self.invert_vars = {}, {}
-        rows = [("cursorXAxis","CURSOR X","invertX","INV X"),
-                ("cursorYAxis","CURSOR Y","invertY","INV Y"),
-                ("clickAxis",  "CLICK",   "invertClick","INV CLK")]
-        for r,(ak,al,ik,il) in enumerate(rows):
+        rows = [
+            ("cursorXAxis", "CURSOR X",  "invertX",     "INV X"),
+            ("cursorYAxis", "CURSOR Y",  "invertY",     "INV Y"),
+            ("clickAxis",   "CLICK",     "invertClick", "INV CLK"),
+        ]
+        for r, (ak, al, ik, il) in enumerate(rows):
             tk.Label(p, text=al, bg=C["bg1"], fg=C["text1"],
                      font=FONT_TINY, width=9, anchor="w").grid(
                          row=r, column=0, sticky="w", pady=3)
             var = tk.StringVar()
             ttk.Combobox(p, textvariable=var, values=AXIS_NAMES,
                          width=14, state="readonly").grid(
-                             row=r, column=1, sticky="w", padx=(4,16))
+                             row=r, column=1, sticky="w", padx=(4, 16))
             self.axis_vars[ak] = var
             ivar = tk.BooleanVar()
             tk.Checkbutton(p, text=il, variable=ivar,
@@ -629,26 +599,21 @@ class App(tk.Tk):
 
     def _build_deadzones(self, p):
         self.dead_sliders, self.dead_vizzes, self.gain_sliders = {}, {}, {}
-
         viz_row = tk.Frame(p, bg=C["bg1"])
         viz_row.pack(fill="x", pady=(0, 6))
         for key, lbl in [("deadzoneX","X"),("deadzoneY","Y"),("deadzoneClick","CLK")]:
             cell = tk.Frame(viz_row, bg=C["bg1"])
             cell.pack(side="left", padx=10)
-            v = DeadzoneViz(cell, lbl)
-            v.pack()
+            v  = DeadzoneViz(cell, lbl); v.pack()
             sl = PrecisionSlider(cell, 0.0, 20.0, 0.1,
                                  initial=self.cfg.get(key, 1.5), width=70,
                                  on_change=lambda val, k=key: self._on_dead(k, val))
-            sl.pack(pady=(3,0))
-            self.dead_vizzes[key] = v
+            sl.pack(pady=(3, 0))
+            self.dead_vizzes[key]  = v
             self.dead_sliders[key] = sl
-
         tk.Frame(p, bg=C["border"], height=1).pack(fill="x", pady=4)
-
         for key, lbl in [("gainX","GAIN X"),("gainY","GAIN Y")]:
-            row = tk.Frame(p, bg=C["bg1"])
-            row.pack(fill="x", pady=2)
+            row = tk.Frame(p, bg=C["bg1"]); row.pack(fill="x", pady=2)
             tk.Label(row, text=lbl, bg=C["bg1"], fg=C["text1"],
                      font=FONT_TINY, width=9, anchor="w").pack(side="left")
             sl = PrecisionSlider(row, 0.05, 3.0, 0.05,
@@ -658,45 +623,34 @@ class App(tk.Tk):
 
     def _build_gestures(self, p):
         p.columnconfigure(0, weight=1)
-        self.thresh_sliders = {}
-
-        # Per-gesture enable switches
+        self.thresh_sliders      = {}
         self.gesture_toggle_vars = {}
-        toggles = tk.Frame(p, bg=C["bg1"])
-        toggles.pack(fill="x", pady=(0, 6))
-        toggles.columnconfigure(0, weight=1)
-        toggles.columnconfigure(1, weight=1)
-        toggle_specs = [
-            ("enableFlick", "Enable Flick"),
-            ("enableShake", "Enable Shake"),
+        toggles = tk.Frame(p, bg=C["bg1"]); toggles.pack(fill="x", pady=(0,6))
+        toggles.columnconfigure(0, weight=1); toggles.columnconfigure(1, weight=1)
+        for i, (key, label) in enumerate([
+            ("enableFlick",      "Enable Flick"),
+            ("enableShake",      "Enable Shake"),
             ("enableDoubleTilt", "Enable Double-Tilt"),
-            ("enableCircle", "Enable Circle"),
-        ]
-        for i, (key, label) in enumerate(toggle_specs):
+            ("enableCircle",     "Enable Circle"),
+        ]):
             var = tk.BooleanVar(value=self.cfg.get(key, True))
-            cb = tk.Checkbutton(
-                toggles, text=label, variable=var,
-                bg=C["bg1"], fg=C["text1"], selectcolor=C["bg3"],
-                activebackground=C["bg1"], font=FONT_TINY,
-                relief="flat", bd=0, highlightthickness=0,
-            )
-            cb.grid(row=i // 2, column=i % 2, sticky="w", pady=1, padx=(0, 8))
+            tk.Checkbutton(toggles, text=label, variable=var,
+                           bg=C["bg1"], fg=C["text1"], selectcolor=C["bg3"],
+                           activebackground=C["bg1"], font=FONT_TINY,
+                           relief="flat", bd=0, highlightthickness=0).grid(
+                               row=i//2, column=i%2, sticky="w", pady=1, padx=(0,8))
             self.gesture_toggle_vars[key] = var
-
-        tk.Frame(p, bg=C["border"], height=1).pack(fill="x", pady=(2, 6))
-
-        specs = [
-            ("tiltThreshDeg", "Tilt threshold", "°",    5,  90,  0.5),
-            ("flickVelThresh","Flick speed",    "°/s", 40, 400,  5.0),
-            ("flickReturnDeg","Flick return",   "°",    1,  30,  0.5),
-            ("flickConfirmMs","Flick window",   "ms",  80, 800, 10.0),
-            ("shakeVelThresh","Shake speed",    "°/s", 20, 300,  5.0),
-            ("doubleTiltDeg", "Double-tilt",    "°",    5,  80,  0.5),
-            ("circleMinSpeed","Circle speed",   "°/s",  5, 120,  1.0),
-        ]
-        for key, lbl, unit, lo, hi, res in specs:
-            row = tk.Frame(p, bg=C["bg1"])
-            row.pack(fill="x", pady=2)
+        tk.Frame(p, bg=C["border"], height=1).pack(fill="x", pady=(2,6))
+        for key, lbl, unit, lo, hi, res in [
+            ("tiltThreshDeg",  "Tilt threshold", "°",    5,  90,  0.5),
+            ("flickVelThresh", "Flick speed",    "°/s", 40, 400,  5.0),
+            ("flickReturnDeg", "Flick return",   "°",    1,  30,  0.5),
+            ("flickConfirmMs", "Flick window",   "ms",  80, 800, 10.0),
+            ("shakeVelThresh", "Shake speed",    "°/s", 20, 300,  5.0),
+            ("doubleTiltDeg",  "Double-tilt",    "°",    5,  80,  0.5),
+            ("circleMinSpeed", "Circle speed",   "°/s",  5, 120,  1.0),
+        ]:
+            row = tk.Frame(p, bg=C["bg1"]); row.pack(fill="x", pady=2)
             row.columnconfigure(1, weight=1)
             tk.Label(row, text=f"{lbl} ({unit})", bg=C["bg1"], fg=C["text1"],
                      font=FONT_TINY, width=22, anchor="w").pack(side="left")
@@ -707,23 +661,18 @@ class App(tk.Tk):
 
     def _build_live(self, p):
         self.axis_bars = []
-        for i, name in enumerate(["YAW", "PITCH", "ROLL"]):
-            row = tk.Frame(p, bg=C["bg1"])
-            row.pack(fill="x", pady=2)
+        for name in ["YAW", "PITCH", "ROLL"]:
+            row = tk.Frame(p, bg=C["bg1"]); row.pack(fill="x", pady=2)
             row.columnconfigure(1, weight=1)
             tk.Label(row, text=name, bg=C["bg1"], fg=C["accent"],
                      font=("Consolas", 8, "bold"), width=6, anchor="w").pack(side="left")
-            bar = AxisBar(row)
-            bar.pack(side="left", fill="x", expand=True)
+            bar = AxisBar(row); bar.pack(side="left", fill="x", expand=True)
             self.axis_bars.append(bar)
 
     def _build_log(self, p):
-        p.columnconfigure(0, weight=1)
-        p.rowconfigure(0, weight=1)
-        frame = tk.Frame(p, bg=C["bg1"])
-        frame.pack(fill="both", expand=True)
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
+        p.columnconfigure(0, weight=1); p.rowconfigure(0, weight=1)
+        frame = tk.Frame(p, bg=C["bg1"]); frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1); frame.rowconfigure(0, weight=1)
         self.gesture_log = tk.Text(
             frame, bg=C["bg0"], fg=C["purple"], font=("Consolas", 9),
             relief="flat", state="disabled", wrap="word", padx=6, pady=4,
@@ -745,15 +694,17 @@ class App(tk.Tk):
         }
         for i, bar in enumerate(self.axis_bars):
             v = self.axes[i] if i < len(self.axes) else 0.0
-            d = next((self.cfg.get(k,0) for k,ax in dead_axis.items() if ax==i), 0.0)
+            d = next(
+                (self.cfg.get(k, 0) for k, ax in dead_axis.items() if ax == i),
+                0.0
+            )
             bar.update(v, d)
-
         for key, viz in self.dead_vizzes.items():
-            ax_key = {"deadzoneX":"cursorXAxis","deadzoneY":"cursorYAxis",
+            ax_key = {"deadzoneX":"cursorXAxis",
+                      "deadzoneY":"cursorYAxis",
                       "deadzoneClick":"clickAxis"}[key]
             ax = self.cfg.get(ax_key, 0)
             if ax < len(self.axes): viz.set_value(self.axes[ax])
-
         self.after(50, self._live_loop)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -772,7 +723,7 @@ class App(tk.Tk):
     # ── Widget ↔ cfg ──────────────────────────────────────────────────────────
     def _apply_cfg_to_widgets(self):
         for k, v in self.axis_vars.items():
-            v.set(AXIS_NAMES[min(self.cfg.get(k,0), len(AXIS_NAMES)-1)])
+            v.set(AXIS_NAMES[min(self.cfg.get(k, 0), len(AXIS_NAMES)-1)])
         for k, v in self.invert_vars.items():
             v.set(self.cfg.get(k, False))
         for k, v in self.gesture_toggle_vars.items():
@@ -788,28 +739,27 @@ class App(tk.Tk):
         for k, v in self.axis_vars.items():
             try: self.cfg[k] = AXIS_NAMES.index(v.get())
             except ValueError: pass
-        for k, v in self.invert_vars.items():  self.cfg[k] = v.get()
+        for k, v in self.invert_vars.items():   self.cfg[k] = v.get()
         for k, v in self.gesture_toggle_vars.items(): self.cfg[k] = v.get()
-        for k, sl in self.dead_sliders.items(): self.cfg[k] = sl.get()
-        for k, sl in self.gain_sliders.items(): self.cfg[k] = sl.get()
+        for k, sl in self.dead_sliders.items():  self.cfg[k] = sl.get()
+        for k, sl in self.gain_sliders.items():  self.cfg[k] = sl.get()
         for k, sl in self.thresh_sliders.items(): self.cfg[k] = sl.get()
 
-    # ── BLE callbacks ──────────────────────────────────────────────────────
-    def _on_data(self, axes):     self.axes = axes
-    def _on_gesture(self, msg):   self.after(0, lambda: self._log_gesture(msg))
-    def _on_status(self, code):   self.after(0, lambda: self._set_status(code))
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+    def _on_gesture(self, msg): self.after(0, lambda: self._log_gesture(msg))
+    def _on_status(self, code): self.after(0, lambda: self._set_status(code))
 
     def _set_status(self, code):
-        if   code == "connected":    text, col = "CONNECTED",     C["green"]
-        elif code == "ack":          text, col = "CFG APPLIED ✓", C["green"]
-        elif code == "no_response":  text, col = "NO RESPONSE",   C["amber"]
-        elif code.startswith("error:"): text, col = "ERROR",      C["red"]
-        else:                        text, col = "DISCONNECTED",  C["red"]
+        if   code == "connected":       text, col = "CONNECTED",     C["green"]
+        elif code == "ack":             text, col = "CFG APPLIED ✓", C["green"]
+        elif code.startswith("error:"): text, col = "ERROR",         C["red"]
+        else:                           text, col = "DISCONNECTED",  C["red"]
         self.status_lbl.configure(text=text, fg=col)
         self.led.itemconfig(self._led, fill=col)
 
     def _log_gesture(self, msg):
-        text = f"[{time.strftime('%H:%M:%S')}]  {msg.get('gesture','?'):<12}{msg.get('axis','')}\n"
+        text = (f"[{time.strftime('%H:%M:%S')}]  "
+                f"{msg.get('gesture','?'):<12}{msg.get('axis','')}\n")
         self.gesture_log.configure(state="normal")
         self.gesture_log.insert("end", text)
         self.gesture_log.see("end")
@@ -823,96 +773,90 @@ class App(tk.Tk):
         self.gesture_log.configure(state="disabled")
 
     # ── Actions ───────────────────────────────────────────────────────────────
-    def _scan_ble(self):
-        self._set_status("scanning")
-        def run_scan():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            devices = loop.run_until_complete(BleakScanner.discover(timeout=3.0))
-            self.after(0, lambda: self._update_device_list(devices))
-        threading.Thread(target=run_scan, daemon=True).start()
-
-    def _update_device_list(self, devices):
-        names = []
-        self.device_addresses = {}
-        for d in devices:
-            name = d.name or "Unknown"
-            display = f"{name} ({d.address})"
-            names.append(display)
-            self.device_addresses[display] = d.address
-        self.device_cb["values"] = names
-        if names:
-            self.device_var.set(names[0])
-        self._set_status("disconnected")
-
     def _connect(self):
-        port = self.port_var.get()
-        if self.serial:
-            self.serial.stop()
-            self.serial = None
+        """Open the HID interface. The device must already be BT-paired."""
+        if hid is None:
+            messagebox.showerror("HID library error", hid_import_diagnostic())
+            return
         if self.hid_thread:
             self.hid_thread.stop()
             self.hid_thread = None
+
         self._set_status("connecting")
-        if port:
-            self.serial = SerialThread(port, 115200,
-                                       self._on_data, self._on_gesture, self._on_status)
-            self.serial.start()
         self.hid_thread = HIDThread(self._on_gesture, self._on_status)
         self.hid_thread.start()
 
     def _apply(self):
+        """Push current widget values to the device via HID feature reports."""
         self._widgets_to_cfg()
         if not self.hid_thread or not self.hid_thread.connected:
-            messagebox.showinfo("Not connected", "Connect to ESP32 HID first.")
+            messagebox.showinfo(
+                "Not connected",
+                "Click CONNECT first.\n\n"
+                "Make sure the ESP32 MPU Mouse is paired and connected "
+                "in Windows Bluetooth settings."
+            )
+            return
+        pages = cfg_to_feature_pages(self.cfg)
+
+        def _send():
+            try:
+                for page in pages:
+                    self.hid_thread.send_feature(page)
+                    time.sleep(0.02)
+                self.after(0, lambda: self._set_status("ack"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("HID error", str(e)))
+                self.after(0, lambda: self._set_status(f"error:{e}"))
+
+        threading.Thread(target=_send, daemon=True).start()
+
+    def _save_config(self):
+        self._widgets_to_cfg()
+        try:
+            with open(SAVE_FILE, "w") as f:
+                json.dump(self.cfg, f, indent=2)
+            self._set_status("ack")
+        except OSError as e:
+            messagebox.showerror("Save error", str(e))
+
+    def _load_config(self):
+        try:
+            with open(SAVE_FILE) as f:
+                self.cfg.update(json.load(f))
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        # Migrate old key name
+        if "tiltThreshDeg" not in self.cfg and "clickThreshDeg" in self.cfg:
+            self.cfg["tiltThreshDeg"] = self.cfg.pop("clickThreshDeg")
+        self.cfg.pop("clickThreshDeg", None)
+
+    def _load_and_apply(self):
+        """Read current config back from the device via HID feature reports."""
+        if not self.hid_thread or not self.hid_thread.connected:
+            # Fall back to JSON file if not connected
+            self._load_config()
+            self._apply_cfg_to_widgets()
             return
         try:
-            for page in cfg_to_feature_pages(self.cfg):
-                self.hid_thread.send_feature(page)
-                time.sleep(0.02)
+            for page in (FEATURE_PAGE_BASIC, FEATURE_PAGE_GAINS,
+                         FEATURE_PAGE_FLICK, FEATURE_PAGE_OTHER_GESTURES):
+                merge_feature_page(self.cfg, self.hid_thread.get_feature(page))
+            self._apply_cfg_to_widgets()
             self._set_status("ack")
         except Exception as e:
             messagebox.showerror("HID error", str(e))
             self._set_status(f"error:{e}")
 
-    def _save_config(self):
-        self._widgets_to_cfg()
-        with open(SAVE_FILE, "w") as f: json.dump(self.cfg, f, indent=2)
-        if self.ble_thread and self.ble_thread.connected:
-            self.ble_thread.send({"save": 1})
-        self._set_status("ack")
-
-    def _load_config(self):
-        try:
-            with open(SAVE_FILE) as f: self.cfg.update(json.load(f))
-        except (FileNotFoundError, json.JSONDecodeError): pass
-        if "tiltThreshDeg" not in self.cfg and "clickThreshDeg" in self.cfg:
-            self.cfg["tiltThreshDeg"] = self.cfg["clickThreshDeg"]
-        self.cfg.pop("clickThreshDeg", None)
-        # remove normalization of shortcuts since it was undefined anyway
-
-    def _load_and_apply(self):
-        if self.hid_thread and self.hid_thread.connected:
-            try:
-                for page in (FEATURE_PAGE_BASIC, FEATURE_PAGE_GAINS,
-                             FEATURE_PAGE_FLICK, FEATURE_PAGE_OTHER_GESTURES):
-                    merge_feature_page(self.cfg, self.hid_thread.get_feature(page))
-                self._apply_cfg_to_widgets()
-                self._set_status("ack")
-                return
-            except Exception as e:
-                messagebox.showerror("HID error", str(e))
-                self._set_status(f"error:{e}")
-                return
-        self._load_config(); self._apply_cfg_to_widgets()
-
     def _reset_defaults(self):
-        self.cfg = dict(DEFAULT_CFG); self._apply_cfg_to_widgets(); self._apply()
+        self.cfg = dict(DEFAULT_CFG)
+        self._apply_cfg_to_widgets()
+        self._apply()
 
     def _on_close(self):
-        if self.serial: self.serial.stop()
         if self.hid_thread: self.hid_thread.stop()
         self.destroy()
+
 
 if __name__ == "__main__":
     App().mainloop()
