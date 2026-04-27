@@ -11,6 +11,8 @@ import json
 import threading
 import time
 import tkinter as tk
+import ctypes
+from ctypes import wintypes
 from tkinter import ttk, messagebox
 
 try:
@@ -67,6 +69,13 @@ FEATURE_PAGE_SELECT          = 0x7F
 
 GESTURE_NAMES = {1: "Flick", 2: "Shake", 3: "DoubleTilt", 4: "Circle"}
 AXIS_SHORT    = ["YAW", "PITCH", "ROLL", ""]
+
+# Global hotkey for RECENTER (Windows only)
+HOTKEY_MOD_CONTROL = 0x0002
+HOTKEY_MOD_ALT = 0x0001
+HOTKEY_VK_Q = 0x51
+HOTKEY_LABEL = "Ctrl+Alt+Q"
+HOTKEY_MODIFIERS = HOTKEY_MOD_CONTROL | HOTKEY_MOD_ALT
 
 # ─── Colour palette ───────────────────────────────────────────────────────────
 C = {
@@ -300,6 +309,55 @@ class HIDThread(threading.Thread):
         self._stop.set()
 
 
+class GlobalHotkeyListener(threading.Thread):
+    """Windows-only global hotkey listener using RegisterHotKey."""
+
+    WM_HOTKEY = 0x0312
+    WM_NULL = 0x0000
+
+    def __init__(self, callback, modifiers, vk, hotkey_id=1):
+        super().__init__(daemon=True)
+        self._callback = callback
+        self._modifiers = modifiers
+        self._vk = vk
+        self._hotkey_id = hotkey_id
+        self._registered = False
+        self._thread_id = None
+        self.error = None
+
+    def run(self):
+        if not hasattr(ctypes, "windll"):
+            self.error = "Global hotkey is only supported on Windows."
+            return
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        self._thread_id = kernel32.GetCurrentThreadId()
+        if not user32.RegisterHotKey(None, self._hotkey_id, self._modifiers, self._vk):
+            self.error = "Could not register global hotkey (already in use)."
+            return
+        self._registered = True
+
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            if msg.message == self.WM_HOTKEY and msg.wParam == self._hotkey_id:
+                try:
+                    self._callback()
+                except Exception:
+                    pass
+
+        if self._registered:
+            user32.UnregisterHotKey(None, self._hotkey_id)
+            self._registered = False
+
+    def stop(self):
+        if not hasattr(ctypes, "windll"):
+            return
+        user32 = ctypes.windll.user32
+        if self._thread_id:
+            user32.PostThreadMessageW(self._thread_id, self.WM_NULL, 0, 0)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Custom widgets
 # ─────────────────────────────────────────────────────────────────────────────
@@ -479,12 +537,14 @@ class App(tk.Tk):
 
         self.cfg        = dict(DEFAULT_CFG)
         self.hid_thread = None
+        self.hotkey_listener = None
         self.axes       = [0.0, 0.0, 0.0]
 
         self._load_config()
         self._setup_style()
         self._build_ui()
         self._apply_cfg_to_widgets()
+        self._setup_hotkey()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._live_loop()
 
@@ -530,6 +590,10 @@ class App(tk.Tk):
                                    bg=C["bg0"], fg=C["red"],
                                    font=("Consolas", 8, "bold"), padx=8)
         self.status_lbl.pack(side="left")
+
+        tk.Label(top, text=f"HOTKEY: {HOTKEY_LABEL} (RECENTER)",
+             bg=C["bg0"], fg=C["text1"],
+             font=("Consolas", 8), padx=10).pack(side="right")
 
         # Body
         body = tk.Frame(self, bg=C["bg0"])
@@ -726,6 +790,25 @@ class App(tk.Tk):
     def _on_dead(self, key, val):
         self.dead_vizzes[key].set_dead(val)
 
+    def _setup_hotkey(self):
+        """Register a system-wide RECENTER shortcut on Windows."""
+        self.hotkey_listener = GlobalHotkeyListener(
+            callback=lambda: self.after(0, lambda: self._recenter(silent=True)),
+            modifiers=HOTKEY_MODIFIERS,
+            vk=HOTKEY_VK_Q,
+        )
+        self.hotkey_listener.start()
+
+        def _check_hotkey_status():
+            if self.hotkey_listener and self.hotkey_listener.error:
+                messagebox.showwarning(
+                    "Hotkey unavailable",
+                    f"Global hotkey {HOTKEY_LABEL} could not be registered.\n"
+                    "It may already be used by another app."
+                )
+
+        self.after(300, _check_hotkey_status)
+
     # ── Widget ↔ cfg ──────────────────────────────────────────────────────────
     def _apply_cfg_to_widgets(self):
         for k, v in self.axis_vars.items():
@@ -817,10 +900,11 @@ class App(tk.Tk):
 
         threading.Thread(target=_send, daemon=True).start()
 
-    def _recenter(self):
+    def _recenter(self, silent=False):
         """Send command to recenter the device's idle position."""
         if not self.hid_thread or not self.hid_thread.connected:
-            messagebox.showinfo("Not connected", "Connect the device first.")
+            if not silent:
+                messagebox.showinfo("Not connected", "Connect the device first.")
             return
         def _send_recenter():
             try:
@@ -874,6 +958,7 @@ class App(tk.Tk):
 
     def _on_close(self):
         if self.hid_thread: self.hid_thread.stop()
+        if self.hotkey_listener: self.hotkey_listener.stop()
         self.destroy()
 
 
