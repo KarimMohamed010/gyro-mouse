@@ -553,6 +553,16 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._live_loop()
         self.after(300, self._auto_connect_loop)
+    
+    def _center_cursor_on_screen(self):
+        user32 = ctypes.windll.user32
+        screen_w = user32.GetSystemMetrics(0)
+        screen_h = user32.GetSystemMetrics(1)
+
+        center_x = screen_w // 2
+        center_y = screen_h // 2
+
+        user32.SetCursorPos(center_x, center_y)
 
     def _setup_style(self):
         s = ttk.Style(self)
@@ -963,6 +973,7 @@ class App(tk.Tk):
         def _send_recenter():
             try:
                 self.hid_thread.send_feature([0x7E, 1, 0, 0, 0, 0, 0, 0])
+                self._center_cursor_on_screen()
                 self.after(0, lambda: self._set_status("ack"))
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror("HID error", str(e)))
