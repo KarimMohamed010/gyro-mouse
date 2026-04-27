@@ -49,7 +49,7 @@ DEFAULT_CFG = {
     "flickVelThresh": 120.0, "flickReturnDeg": 8.0, "flickConfirmMs": 300,
     "shakeVelThresh": 60.0, "doubleTiltDeg": 25.0, "circleMinSpeed": 20.0,
     "enableFlick": True, "enableShake": True,
-    "enableDoubleTilt": True, "enableCircle": True,
+    "enableDoubleTilt": True, "enableCircle": True, "enableClicks": True,
 }
 
 HID_VID     = 0xE502
@@ -110,6 +110,7 @@ def cfg_to_feature_pages(cfg):
     p[2] = ((0x01 if cfg.get("invertX",        False) else 0)
             | (0x02 if cfg.get("invertY",       False) else 0)
             | (0x04 if cfg.get("invertClick",   False) else 0)
+            | (0x08 if cfg.get("enableClicks",  True)  else 0)
             | (0x10 if cfg.get("enableFlick",   True)  else 0)
             | (0x20 if cfg.get("enableShake",   True)  else 0)
             | (0x40 if cfg.get("enableDoubleTilt", True) else 0)
@@ -156,6 +157,7 @@ def merge_feature_page(cfg, payload):
         cfg["invertX"]          = bool(fl & 0x01)
         cfg["invertY"]          = bool(fl & 0x02)
         cfg["invertClick"]      = bool(fl & 0x04)
+        cfg["enableClicks"]     = bool(fl & 0x08)
         cfg["enableFlick"]      = bool(fl & 0x10)
         cfg["enableShake"]      = bool(fl & 0x20)
         cfg["enableDoubleTilt"] = bool(fl & 0x40)
@@ -516,6 +518,9 @@ class App(tk.Tk):
         self._btn(top, "CONNECT", self._connect, accent=True).pack(
             side="left", padx=10)
 
+        self._btn(top, "RECENTER", self._recenter, accent=False).pack(
+            side="left", padx=(0, 10))
+
         self.led = tk.Canvas(top, width=10, height=10,
                              bg=C["bg0"], highlightthickness=0)
         self.led.pack(side="left", padx=(4, 2))
@@ -628,6 +633,7 @@ class App(tk.Tk):
         toggles = tk.Frame(p, bg=C["bg1"]); toggles.pack(fill="x", pady=(0,6))
         toggles.columnconfigure(0, weight=1); toggles.columnconfigure(1, weight=1)
         for i, (key, label) in enumerate([
+            ("enableClicks",     "Enable Clicks"),
             ("enableFlick",      "Enable Flick"),
             ("enableShake",      "Enable Shake"),
             ("enableDoubleTilt", "Enable Double-Tilt"),
@@ -810,6 +816,19 @@ class App(tk.Tk):
                 self.after(0, lambda: self._set_status(f"error:{e}"))
 
         threading.Thread(target=_send, daemon=True).start()
+
+    def _recenter(self):
+        """Send command to recenter the device's idle position."""
+        if not self.hid_thread or not self.hid_thread.connected:
+            messagebox.showinfo("Not connected", "Connect the device first.")
+            return
+        def _send_recenter():
+            try:
+                self.hid_thread.send_feature([0x7E, 1, 0, 0, 0, 0, 0, 0])
+                self.after(0, lambda: self._set_status("ack"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("HID error", str(e)))
+        threading.Thread(target=_send_recenter, daemon=True).start()
 
     def _save_config(self):
         self._widgets_to_cfg()

@@ -46,6 +46,7 @@ constexpr uint8_t FEATURE_PAGE_BASIC = 0;
 constexpr uint8_t FEATURE_PAGE_GAINS = 1;
 constexpr uint8_t FEATURE_PAGE_FLICK = 2;
 constexpr uint8_t FEATURE_PAGE_OTHER_GESTURES = 3;
+constexpr uint8_t FEATURE_PAGE_COMMAND = 0x7E;
 constexpr uint8_t FEATURE_PAGE_SELECT = 0x7F;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -81,11 +82,14 @@ struct Config
   bool enableShake = true;
   bool enableDoubleTilt = true;
   bool enableCircle = true;
+  bool enableClicks = true;
 };
 
 Config cfg;
 Preferences prefs;
 float axes[3] = {};
+float idleOffset[3] = {};
+volatile bool requestRecenter = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utility
@@ -222,7 +226,7 @@ void buildFeaturePayload(uint8_t page, uint8_t out[FEATURE_PAYLOAD_SIZE])
   {
   case FEATURE_PAGE_BASIC:
     out[1] = ((cfg.cursorXAxis & 0x03) | ((cfg.cursorYAxis & 0x03) << 2) | ((cfg.clickAxis & 0x03) << 4));
-    out[2] = (cfg.invertX ? 0x01 : 0) | (cfg.invertY ? 0x02 : 0) | (cfg.invertClick ? 0x04 : 0) | (cfg.enableFlick ? 0x10 : 0) | (cfg.enableShake ? 0x20 : 0) | (cfg.enableDoubleTilt ? 0x40 : 0) | (cfg.enableCircle ? 0x80 : 0);
+    out[2] = (cfg.invertX ? 0x01 : 0) | (cfg.invertY ? 0x02 : 0) | (cfg.invertClick ? 0x04 : 0) | (cfg.enableClicks ? 0x08 : 0) | (cfg.enableFlick ? 0x10 : 0) | (cfg.enableShake ? 0x20 : 0) | (cfg.enableDoubleTilt ? 0x40 : 0) | (cfg.enableCircle ? 0x80 : 0);
     out[3] = clampU8(cfg.deadzoneX, 10.f);
     out[4] = clampU8(cfg.deadzoneY, 10.f);
     out[5] = clampU8(cfg.deadzoneClick, 10.f);
@@ -260,6 +264,11 @@ void refreshFeatureCharacteristic()
 void applyFeaturePayload(const uint8_t data[FEATURE_PAYLOAD_SIZE])
 {
   const uint8_t page = data[0];
+  if (page == FEATURE_PAGE_COMMAND)
+  {
+    if (data[1] == 1) requestRecenter = true;
+    return;
+  }
   if (page == FEATURE_PAGE_SELECT)
   {
     if (data[1] <= FEATURE_PAGE_OTHER_GESTURES)
@@ -276,6 +285,7 @@ void applyFeaturePayload(const uint8_t data[FEATURE_PAYLOAD_SIZE])
     cfg.invertX = (data[2] & 0x01) != 0;
     cfg.invertY = (data[2] & 0x02) != 0;
     cfg.invertClick = (data[2] & 0x04) != 0;
+    cfg.enableClicks = (data[2] & 0x08) != 0;
     cfg.enableFlick = (data[2] & 0x10) != 0;
     cfg.enableShake = (data[2] & 0x20) != 0;
     cfg.enableDoubleTilt = (data[2] & 0x40) != 0;
@@ -331,6 +341,7 @@ class HidServerCallbacks : public BLEServerCallbacks
   {
     hidConnected = true;
     hidConnectedSinceMs = millis();
+    requestRecenter = true;
   }
   void onDisconnect(BLEServer *server) override
   {
@@ -726,9 +737,16 @@ void loop()
   mpu.dmpGetGravity(&gravity, &q);
   mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
-  axes[AXIS_YAW] = ypr[0] * RAD_TO_DEG;
-  axes[AXIS_PITCH] = ypr[1] * RAD_TO_DEG;
-  axes[AXIS_ROLL] = ypr[2] * RAD_TO_DEG;
+  if (requestRecenter) {
+      idleOffset[AXIS_YAW] = ypr[0] * RAD_TO_DEG;
+      idleOffset[AXIS_PITCH] = ypr[1] * RAD_TO_DEG;
+      idleOffset[AXIS_ROLL] = ypr[2] * RAD_TO_DEG;
+      requestRecenter = false;
+  }
+
+  axes[AXIS_YAW] = ypr[0] * RAD_TO_DEG - idleOffset[AXIS_YAW];
+  axes[AXIS_PITCH] = ypr[1] * RAD_TO_DEG - idleOffset[AXIS_PITCH];
+  axes[AXIS_ROLL] = ypr[2] * RAD_TO_DEG - idleOffset[AXIS_ROLL];
 
   const float rawX = applyDeadband(getAxis(cfg.cursorXAxis), cfg.deadzoneX);
   const float rawY = applyDeadband(getAxis(cfg.cursorYAxis), cfg.deadzoneY);
@@ -744,10 +762,12 @@ void loop()
   const bool tiltPos = hidReportsReady(nowMs) && (tiltV > cfg.tiltThreshDeg);
 
   uint8_t buttons = 0;
-  if (tiltNeg)
-    buttons |= 0x01;
-  if (tiltPos)
-    buttons |= 0x02;
+  if (cfg.enableClicks) {
+    if (tiltNeg)
+      buttons |= 0x01;
+    if (tiltPos)
+      buttons |= 0x02;
+  }
 
   const int moveX = constrain(static_cast<int>(roundf(cursorX)), -127, 127);
   const int moveY = constrain(static_cast<int>(roundf(-cursorY)), -127, 127);
