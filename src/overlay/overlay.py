@@ -104,8 +104,8 @@ DWELL_ACTION        = 0.85   # s  double-click / drag / keyboard trigger
 DWELL_KEY           = 0.7    # s  type a key on the dwell keyboard
 ARMED_TIMEOUT       = 7.0    # s  auto-disarm
 
-MOVE_THRESHOLD      = 6      # px
-PREDWELL_DELAY      = 0.18   # s
+MOVE_THRESHOLD      = 3      # px
+PREDWELL_DELAY      = 0.2   # s
 CLICK_COOLDOWN      = 0.30   # s
 
 SCROLL_TICK_MS      = 100    # ms
