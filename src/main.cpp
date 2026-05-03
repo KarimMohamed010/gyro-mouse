@@ -42,8 +42,8 @@ constexpr uint16_t SAMPLE_INTERVAL_MS = 20; // 50 Hz
 //   0.5 = half the error gone each second.  Keep below 1.0.
 //   Too high → feels like the cursor is being pulled back to centre.
 //   Too low  → drift wins.
-constexpr float DRIFT_STILL_THRESHOLD = 0.10f; // ~6°
-constexpr float DRIFT_RATE = 0.5f;             // per second
+constexpr float DRIFT_STILL_THRESHOLD = 0.18f; // ~6°
+constexpr float DRIFT_RATE = 2.0f;             // per second
 
 // ─── Runtime gyro bias estimator ──────────────────────────────────────────────
 // While the device is still we accumulate a low-pass average of the raw gyro
@@ -57,8 +57,8 @@ constexpr float DRIFT_RATE = 0.5f;             // per second
 //   50 frames = 1 second at 50 Hz. Prevents committing during brief pauses.
 // BIAS_APPLY_THRESHOLD_LSB — only rewrite registers if the estimated bias
 //   has changed by more than this many LSBs. Prevents thrashing the I²C bus.
-constexpr float BIAS_LOWPASS_ALPHA = 0.01f;
-constexpr uint16_t BIAS_MIN_STILL_FRAMES = 50; // 1 second
+constexpr float BIAS_LOWPASS_ALPHA = 0.05f;
+constexpr uint16_t BIAS_MIN_STILL_FRAMES = 20; // 1 second
 constexpr int16_t BIAS_APPLY_THRESHOLD_LSB = 2;
 
 // ─── Rotation-vector axis indices (vx=0, vy=1, vz=2) ─────────────────────────
@@ -968,7 +968,7 @@ void loop()
   //     the *source* so future integration is cleaner. Slow but permanent.
   {
     // Tune this (raw MPU6050 gyro LSB; ~131 LSB ≈ 1°/s at default scale)
-    constexpr float STILL_GYRO_THRESHOLD = 10.0f;
+    constexpr float STILL_GYRO_THRESHOLD = 25.0f;
 
     const bool still =
         fabsf(rv[0]) < DRIFT_STILL_THRESHOLD &&
@@ -977,6 +977,19 @@ void loop()
         fabsf(gg.x) < STILL_GYRO_THRESHOLD &&
         fabsf(gg.y) < STILL_GYRO_THRESHOLD &&
         fabsf(gg.z) < STILL_GYRO_THRESHOLD;
+
+    // Print on state change OR every 200 ms while still
+    if (still != prevStill || (still && (nowMs - lastStillPrintMs) > 200))
+    {
+      Serial.printf(
+          "still=%d | rv=(%.3f %.3f %.3f) | gyro=(%d %d %d) | vel=(%.2f %.2f %.2f)\n",
+          still,
+          rv[0], rv[1], rv[2],
+          gg.x, gg.y, gg.z,
+          vel[0], vel[1], vel[2]);
+      lastStillPrintMs = nowMs;
+    }
+    prevStill = still;
 
     if (still)
     {
