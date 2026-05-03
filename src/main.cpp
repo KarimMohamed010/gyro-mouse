@@ -44,6 +44,8 @@ constexpr uint16_t SAMPLE_INTERVAL_MS = 20; // 50 Hz
 //   Too low  → drift wins.
 constexpr float DRIFT_STILL_THRESHOLD = 0.18f; // ~6°
 constexpr float DRIFT_RATE = 2.0f;             // per second
+static bool prevStill = false;
+static uint32_t lastStillPrintMs = 0;
 
 // ─── Runtime gyro bias estimator ──────────────────────────────────────────────
 // While the device is still we accumulate a low-pass average of the raw gyro
